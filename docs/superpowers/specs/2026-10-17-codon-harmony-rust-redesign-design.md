@@ -1,7 +1,12 @@
 # Codon Harmony: Rust redesign
 
 Date: 2026-10-17
-Status: approved, not yet implemented
+Status: historical design underlying the current engine
+
+The [correctness and performance proposal](2026-10-17-engine-correctness-performance-design.md)
+corrects this document's unconditional complexity and validity claims and records
+differences between the original plan and the implementation. Its changes remain
+proposed; this historical document is retained for context.
 
 ## 1. Context
 

@@ -1,5 +1,10 @@
 # Codon Harmony Rust Redesign Implementation Plan
 
+Historical implementation plan. The repository is now under Git; the execution note
+below describes the original working session. For current correctness/performance
+limitations and proposed follow-up phases, see the
+[corrective design](../specs/2026-10-17-engine-correctness-performance-design.md).
+
 > **Execution note:** this plan is executed inline, in the session that wrote it and the
 > spec (`docs/superpowers/specs/2026-10-17-codon-harmony-rust-redesign-design.md`), so
 > tasks carry interfaces, algorithms, test cases and exact commands rather than a full
