@@ -16,3 +16,7 @@ dist/
 # Generated sequences
 out.fasta
 failed_seqs.fasta
+
+# Written by the Python test suite's codon table downloader
+human_codon_table
+human_codon_table.json
