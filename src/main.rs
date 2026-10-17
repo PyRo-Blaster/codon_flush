@@ -259,6 +259,11 @@ fn report(record: &Record, composition: &Composition, outcome: &Outcome, host: &
         "  moves                        {} ({} substitutions, restart {})",
         outcome.moves, outcome.substitutions, outcome.restart
     );
+    if !composition.gc_in_band {
+        println!(
+            "  WARNING whole-gene GC is outside its band and correcting it would cost \n             \x20         more deviation than --max-relax allows"
+        );
+    }
     let unused = metrics::unused_codons(&outcome.state, host);
     if !unused.is_empty() {
         println!(

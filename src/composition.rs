@@ -23,6 +23,11 @@ pub struct Composition {
     pub budget_left: f64,
     /// Codon moves spent pulling GC into its band.
     pub gc_moves: u32,
+    /// Whether whole-gene GC ended up inside its band. It can be false when correcting
+    /// it would cost more deviation than `max_relax` allows; the gene is still built,
+    /// and the shortfall is reported rather than paid for out of budget the caller
+    /// said was not available.
+    pub gc_in_band: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +161,7 @@ pub fn build(
 
     let mut gc_moves = 0;
     let mut gc = gc_fraction(&counts);
+    let mut gc_in_band = true;
     while gc < gc_band.0 || gc > gc_band.1 {
         let want_more_gc = gc < gc_band.0;
         let Some(mv) = best_gc_move(&counts, host, want_more_gc) else {
@@ -164,8 +170,17 @@ pub fn build(
                 band: gc_band,
             });
         };
-        counts[mv.from as usize] -= 1;
-        counts[mv.to as usize] += 1;
+        // Spending here is still spending: a move that would push the gene past
+        // `max_relax` is not affordable, whatever it buys. Without this check the
+        // composition alone could blow the limit before the search even started.
+        let mut trial = counts;
+        trial[mv.from as usize] -= 1;
+        trial[mv.to as usize] += 1;
+        if deviation(&trial, host) > max_relax {
+            gc_in_band = false;
+            break;
+        }
+        counts = trial;
         gc_moves += 1;
         gc = gc_fraction(&counts);
     }
@@ -177,6 +192,7 @@ pub fn build(
         gc,
         budget_left: (max_relax - deviation).max(0.0),
         gc_moves,
+        gc_in_band,
     })
 }
 
@@ -484,6 +500,37 @@ mod tests {
                 .sum();
             assert_eq!(used, group_total[aa as usize]);
         }
+    }
+
+    #[test]
+    fn gc_adjustment_never_spends_past_max_relax() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        // A band GFP's natural composition misses by a long way, so the correction
+        // wants to spend far more than the limit allows.
+        // The apportionment itself has a floor: the best integer allocation of this
+        // protein is already 0.0083 away from the host profile, so a limit below that
+        // cannot be met by anything. What must hold is that the GC correction never
+        // spends beyond the limit, and spends nothing at all when the floor is above it.
+        let floor = build(&seq, &host, 1.0, WIDE_BAND).unwrap().deviation;
+        for band in [(0.30, 0.40), (0.60, 0.70)] {
+            for max_relax in [0.0, 0.02, 0.10] {
+                let comp = build(&seq, &host, max_relax, band).unwrap();
+                assert!(
+                    comp.deviation <= floor.max(max_relax) + 1e-9,
+                    "band {band:?}, max_relax {max_relax}: deviation {} exceeds the limit",
+                    comp.deviation
+                );
+                if floor >= max_relax {
+                    assert_eq!(comp.gc_moves, 0, "nothing was affordable, so nothing should be spent");
+                }
+                assert!(!comp.gc_in_band, "this band is meant to be unaffordable");
+            }
+        }
+        // and with budget to spare it still reaches the band
+        let comp = build(&seq, &host, 1.0, (0.30, 0.40)).unwrap();
+        assert!(comp.gc_in_band);
+        assert!(comp.gc <= 0.40 && comp.gc >= 0.30);
     }
 
     #[test]

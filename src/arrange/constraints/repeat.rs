@@ -253,17 +253,21 @@ impl Constraint for Repeats {
                     crate::code::BASE_LETTER[view.base(positions[0] as usize + k) as usize] as char
                 })
                 .collect();
-            let where_else = positions
-                .iter()
-                .map(|p| (p + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            for &at in positions {
+            // One line per copy, each naming only the nearest other copy. Listing
+            // every position in every copy's message made the report quadratic in the
+            // number of copies, and the report is rebuilt whenever the search's queue
+            // empties.
+            for (index, &at) in positions.iter().enumerate() {
+                let nearest = if index == 0 { positions[1] } else { positions[index - 1] };
                 out.push(Violation {
                     kind: Kind::Repeat,
                     at,
                     len: K as u32,
-                    detail: format!("{text} occurs at bases {where_else}"),
+                    detail: format!(
+                        "{text} occurs {} times, nearest other copy at base {}",
+                        positions.len(),
+                        nearest + 1
+                    ),
                 });
             }
         }

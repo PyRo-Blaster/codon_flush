@@ -14,9 +14,6 @@ use crate::code::{complement, Base};
 use super::{Constraint, Kind, Violation};
 
 const STEM: usize = 10;
-/// A stem with more wobble positions than this is matched by scanning instead of by
-/// enumerating its variants.
-const MAX_VARIANTS: usize = 64;
 
 pub struct Hairpins {
     /// How many times each 10-mer occurs in the sequence.
@@ -76,23 +73,13 @@ impl Hairpins {
             .filter(|(_, &b)| b == 1)
             .map(|(i, _)| i)
             .collect();
-        let count = 1usize << wobble.len().min(MAX_VARIANTS.trailing_zeros() as usize + 1);
-        let mut out = Vec::with_capacity(count);
+        // Every wobble position is enumerated. A stem is ten bases, so there are at
+        // most 2^10 variants, and typically about six. An earlier version capped this
+        // and fell back to the all-C and all-T forms for G-rich stems, which silently
+        // lost every mixed C/T partner: a stem of seven G's missed 126 of its 128
+        // variants.
         let combinations = 1usize << wobble.len();
-        if combinations > MAX_VARIANTS {
-            // Too many wobble positions to enumerate; fall back to the C-only form plus
-            // the all-T form, and let `rebuild` catch the rest. Rare in practice: it
-            // needs seven or more G's in one stem.
-            out.push(Self::pack(&partner));
-            let mut all_t = partner.clone();
-            for &i in &wobble {
-                all_t[i] = 3;
-            }
-            out.push(Self::pack(&all_t));
-            out.sort_unstable();
-            out.dedup();
-            return out;
-        }
+        let mut out = Vec::with_capacity(combinations);
         for mask in 0..combinations {
             let mut variant = partner.clone();
             for (bit, &index) in wobble.iter().enumerate() {

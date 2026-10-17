@@ -121,9 +121,10 @@ TTG; the original purine-run rule is still selectable. Repeats, hairpins, restri
 sites and splice motifs keep their original meanings.
 
 Constraints the engine cannot satisfy are reported with position and cause, and the
-process exits non-zero. Some are genuinely unsatisfiable: tandem-repeat proteins force
-repeated 9-mers, and four lysines with three AAA in the multiset give six consecutive
-A's however they are arranged.
+process exits non-zero. A stopped search is not a proof of infeasibility. Some cases are
+provably impossible: three consecutive methionines are ATG ATG ATG in every encoding,
+and four lysines with three AAA in the multiset give six consecutive A's however they
+are arranged. Repetitive proteins are hard rather than proven impossible.
 
 ## Design documents
 

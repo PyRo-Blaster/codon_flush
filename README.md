@@ -57,9 +57,10 @@ Scaling, single thread, random proteins of realistic composition: 1600 aa 1.05 s
 the Python's 2.0.
 
 Anything the engine cannot fix is reported with its position and cause, and the process
-exits non-zero. Some constraints are genuinely unsatisfiable: a protein built from
-tandem repeats forces repeated 9-mers, and four lysines with three AAA in the multiset
-give six consecutive A's however they are arranged.
+exits non-zero. A search that stops is not a proof of infeasibility, though some cases
+provably are: three consecutive methionines are ATG ATG ATG in every encoding, and four
+lysines with three AAA in the multiset give six consecutive A's however they are
+arranged. Highly repetitive proteins are merely hard, not proven impossible.
 
 ## Usage
 

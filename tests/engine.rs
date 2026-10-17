@@ -210,3 +210,128 @@ fn fasta_round_trips_through_the_engine() {
         assert_eq!(dna.len(), record.residues.len() * 3);
     }
 }
+
+/// Three defects found by review of the design, each reproduced here so they cannot
+/// come back. See docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md.
+mod regressions {
+    use super::*;
+    use codon_harmony_core::arrange::constraints::{hairpin::Hairpins, repeat::Repeats, Constraint};
+    use codon_harmony_core::arrange::state::SeqState;
+    use codon_harmony_core::code::{codon_aa, complement, parse_codon, Base, CodonIdx};
+
+    fn state_of(dna: &str) -> SeqState {
+        let codons: Vec<CodonIdx> = dna
+            .as_bytes()
+            .chunks(3)
+            .map(|c| parse_codon(std::str::from_utf8(c).unwrap()).unwrap())
+            .collect();
+        let aa: Vec<AaIdx> = codons.iter().copied().map(codon_aa).collect();
+        SeqState::new(aa, codons)
+    }
+
+    /// Independent of the implementation: scan every position for a partner of every
+    /// stem, allowing the G-T wobble.
+    fn hairpin_oracle(state: &SeqState) -> u32 {
+        let view = state.view();
+        let n = state.n_bases();
+        let mut total = 0;
+        for start in (0..n).step_by(10) {
+            if start + 10 > n {
+                continue;
+            }
+            let partner: Vec<Base> =
+                (0..10).rev().map(|k| complement(view.base(start + k))).collect();
+            for at in 0..=n - 10 {
+                if (0..10).all(|k| {
+                    let got = view.base(at + k);
+                    got == partner[k] || (partner[k] == 1 && got == 3)
+                }) {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn g_rich_stems_keep_their_mixed_wobble_matches() {
+        // Seven G's in the stem means 2^7 wobble variants of its partner. An earlier
+        // cap enumerated only the all-C and all-T forms, losing the other 126.
+        let dna = "GGGGGGGAAATTTCCTCCCCACGACGACGA";
+        let state = state_of(dna);
+        let mut hairpins = Hairpins::new();
+        hairpins.rebuild(&state);
+        assert_eq!(hairpins.total(), hairpin_oracle(&state), "mixed wobble match lost");
+        assert_eq!(hairpins.total(), 1, "the planted partner should be found");
+
+        // and the same holds for a stem of ten G's, the worst case
+        let dna = "GGGGGGGGGGTTCTCCCCCCACGACGACGA";
+        let state = state_of(dna);
+        let mut hairpins = Hairpins::new();
+        hairpins.rebuild(&state);
+        assert_eq!(hairpins.total(), hairpin_oracle(&state));
+    }
+
+    #[test]
+    fn a_positive_deviation_limit_is_never_exceeded() {
+        let host = host();
+        let residues = protein(GFP);
+        let max_relax = 0.10;
+        // GC bands GFP cannot reach cheaply: the correction must stop rather than
+        // spend past the limit the caller set.
+        for band in [(0.30, 0.40), (0.60, 0.70)] {
+            let composition = composition::build(&residues, &host, max_relax, band).unwrap();
+            assert!(composition.deviation <= max_relax + 1e-9);
+            let outcome = optimise(
+                &residues,
+                &composition,
+                &host,
+                &Options { seed: 1, ..Default::default() },
+            );
+            assert!(
+                outcome.deviation <= max_relax + 1e-9,
+                "band {band:?}: final deviation {} exceeds max_relax {max_relax}",
+                outcome.deviation
+            );
+            assert!(!composition.gc_in_band, "and the shortfall must be visible");
+        }
+    }
+
+    #[test]
+    fn three_methionines_are_provably_unfixable() {
+        // Unlike the tandem-repeat case, this one is a proof rather than an observation:
+        // Met has exactly one codon, so MMM is ATG ATG ATG in every possible encoding
+        // and trips the identical-codon rule. No move exists at all.
+        let host = host();
+        let residues = protein("AMMMA");
+        let composition = composition::build(&residues, &host, 0.1, (0.0, 1.0)).unwrap();
+        let outcome = optimise(
+            &residues,
+            &composition,
+            &host,
+            &Options { seed: 1, restarts: 1, ..Default::default() },
+        );
+        assert!(outcome.remaining.iter().any(|v| v.kind == Kind::Repeat));
+        assert_eq!(outcome.moves, 0, "there is no move to make");
+    }
+
+    #[test]
+    fn the_repeat_report_stays_linear_in_the_number_of_copies() {
+        // Every copy still gets its own line, but a line names only the nearest other
+        // copy, so the text grows with the copies rather than with their square.
+        let mut sizes = Vec::new();
+        for copies in [8usize, 32] {
+            let state = state_of(&"ACCGAGTCT".repeat(copies));
+            let mut repeats = Repeats::new();
+            repeats.rebuild(&state);
+            let report = repeats.report(&state);
+            assert_eq!(report.len() as u32, repeats.total());
+            sizes.push(report.iter().map(|v| v.detail.len()).sum::<usize>());
+        }
+        let growth = sizes[1] as f64 / sizes[0] as f64;
+        assert!(
+            growth < 6.0,
+            "report text grew {growth:.1}x for 4x the copies, which is quadratic"
+        );
+    }
+}
