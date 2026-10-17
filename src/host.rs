@@ -115,9 +115,12 @@ impl HostTable {
 fn renormalise(freq: &mut [f64; N_CODONS], by_aa: &[Vec<CodonIdx>]) -> Result<()> {
     for (aa, group) in by_aa.iter().enumerate() {
         let total: f64 = group.iter().map(|&c| freq[c as usize]).sum();
+        let letter = crate::code::aa_letter(aa as AaIdx) as char;
         if total <= 0.0 {
-            let letter = crate::code::aa_letter(aa as AaIdx) as char;
             bail!("host table has no usable codon for amino acid {letter}");
+        }
+        if !total.is_finite() {
+            bail!("the frequencies for amino acid {letter} do not add up to a finite total");
         }
         for &c in group {
             freq[c as usize] /= total;
@@ -139,14 +142,15 @@ fn parse_any_shape(text: &str) -> Result<Vec<(CodonIdx, f64)>> {
         match entry {
             serde_json::Value::Object(inner) => {
                 // nested: the key is an amino acid letter
-                if key.len() != 1 || aa_index(key.as_bytes()[0]).is_none() {
+                let Some(aa) = (key.len() == 1).then(|| aa_index(key.as_bytes()[0])).flatten()
+                else {
                     bail!("unknown amino acid key {key:?} in host table");
-                }
+                };
                 for (codon_text, freq) in inner {
-                    insert_codon(&mut out, codon_text, freq)?;
+                    insert_codon(&mut out, codon_text, freq, Some((key.as_str(), aa)))?;
                 }
             }
-            _ => insert_codon(&mut out, key, entry)?,
+            _ => insert_codon(&mut out, key, entry, None)?,
         }
     }
     if out.is_empty() {
@@ -159,9 +163,21 @@ fn insert_codon(
     out: &mut BTreeMap<CodonIdx, f64>,
     codon_text: &str,
     value: &serde_json::Value,
+    under: Option<(&str, crate::code::AaIdx)>,
 ) -> Result<()> {
     let codon = parse_codon(codon_text)
         .with_context(|| format!("{codon_text:?} is not a DNA or RNA codon"))?;
+    // A codon filed under the wrong amino acid would be renormalised into the wrong
+    // group, so the profile would be wrong rather than merely odd.
+    if let Some((key, aa)) = under {
+        if codon_aa(codon) != aa {
+            bail!(
+                "host table files {} under amino acid {key:?}, but it encodes {}",
+                codon_string(codon),
+                crate::code::aa_letter(codon_aa(codon)) as char
+            );
+        }
+    }
     let freq = value
         .as_f64()
         .with_context(|| format!("frequency for {codon_text} is not a number"))?;
@@ -318,5 +334,36 @@ mod tests {
         assert!(HostTable::from_json_str(r#"{"XYZ": 1.0}"#, 0.0).is_err());
         assert!(HostTable::from_json_str(r#"{"GCA": -1.0}"#, 0.0).is_err());
         assert!(HostTable::load(Path::new(ECOLI), 1.5).is_err());
+    }
+
+    #[test]
+    fn a_codon_filed_under_the_wrong_amino_acid_is_rejected() {
+        let err = HostTable::from_json_str(r#"{"A": {"GCA": 0.5, "TTT": 0.5}}"#, 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TTT"), "{err}");
+        assert!(err.contains("encodes F"), "{err}");
+    }
+
+    #[test]
+    fn an_rna_spelled_table_is_the_same_table() {
+        let dna: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(ECOLI).unwrap()).unwrap();
+        let mut rna = serde_json::Map::new();
+        for (aa, group) in dna.as_object().unwrap() {
+            let spelled: serde_json::Map<String, serde_json::Value> = group
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(codon, freq)| (codon.replace('T', "U"), freq.clone()))
+                .collect();
+            rna.insert(aa.clone(), serde_json::Value::Object(spelled));
+        }
+        let from_dna = HostTable::from_json_str(&dna.to_string(), 0.10).unwrap();
+        let from_rna =
+            HostTable::from_json_str(&serde_json::Value::Object(rna).to_string(), 0.10).unwrap();
+        for codon in 0..N_CODONS as CodonIdx {
+            assert_eq!(from_dna.freq(codon), from_rna.freq(codon), "{}", codon_string(codon));
+        }
     }
 }

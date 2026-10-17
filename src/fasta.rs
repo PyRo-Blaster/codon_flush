@@ -22,10 +22,12 @@ impl Record {
 }
 
 /// Parse protein records. Lowercase is accepted, whitespace and digits are ignored, and
-/// a trailing `*` is kept as a stop so the gene can carry its own terminator.
+/// a trailing `*` is kept as a stop so the gene can carry its own terminator. A stop
+/// anywhere else, a blank header and an empty record are all rejected: each would
+/// silently produce a gene that does not encode what was asked for.
 pub fn parse(text: &str) -> Result<Vec<Record>> {
-    let mut records: Vec<Record> = Vec::new();
-    let mut current: Option<Record> = None;
+    let mut records: Vec<(usize, Record)> = Vec::new();
+    let mut current: Option<(usize, Record)> = None;
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with(';') {
@@ -36,14 +38,17 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
                 records.push(record);
             }
             let header = header.trim();
+            if header.is_empty() {
+                bail!("line {}: a record header must name the protein", number + 1);
+            }
             let (id, description) = match header.split_once(char::is_whitespace) {
                 Some((id, rest)) => (id.to_string(), rest.trim().to_string()),
                 None => (header.to_string(), String::new()),
             };
-            current = Some(Record { id, description, residues: Vec::new() });
+            current = Some((number + 1, Record { id, description, residues: Vec::new() }));
             continue;
         }
-        let Some(record) = current.as_mut() else {
+        let Some((_, record)) = current.as_mut() else {
             bail!("line {}: sequence data before any > header", number + 1);
         };
         for letter in line.bytes() {
@@ -52,7 +57,9 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
             }
             let residue = aa_index(letter).with_context(|| {
                 format!(
-                    "line {}: {:?} is not an amino acid; use the 20 standard letters or *",
+                    "record {:?}, line {}: {:?} is not an amino acid; use the 20 standard \
+                     letters or *",
+                    record.id,
                     number + 1,
                     letter as char
                 )
@@ -66,10 +73,23 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
     if records.is_empty() {
         bail!("no FASTA records found");
     }
-    if let Some(empty) = records.iter().find(|r| r.residues.is_empty()) {
-        bail!("record {:?} has no residues", empty.id);
+    for (line, record) in &records {
+        if record.residues.is_empty() {
+            bail!("record {:?} (line {line}) has no residues", record.id);
+        }
+        if let Some(at) = record.residues[..record.residues.len() - 1]
+            .iter()
+            .position(|&aa| aa == crate::code::STOP)
+        {
+            bail!(
+                "record {:?} (line {line}): a stop at residue {} ends the protein before \
+                 its last residue; only a terminal * is accepted",
+                record.id,
+                at + 1
+            );
+        }
     }
-    Ok(records)
+    Ok(records.into_iter().map(|(_, record)| record).collect())
 }
 
 /// One record, wrapped at 60 bases like the Python wrote them.
@@ -113,6 +133,27 @@ mod tests {
     fn ignores_numbering_and_gaps() {
         let records = parse(">x\n1 MSK 4 G-G\n").unwrap();
         assert_eq!(letters(&records[0]), "MSKGG");
+    }
+
+    #[test]
+    fn rejects_an_internal_stop_but_keeps_a_terminal_one() {
+        let err = parse(">x\nMS*KG\n").unwrap_err().to_string();
+        assert!(err.contains("residue 3"), "{err}");
+        assert!(err.contains("terminal"), "{err}");
+        assert_eq!(letters(&parse(">x\nMSKG*\n").unwrap()[0]), "MSKG*");
+    }
+
+    #[test]
+    fn rejects_a_blank_header() {
+        let err = parse(">\nMSKG\n").unwrap_err().to_string();
+        assert!(err.contains("must name the protein"), "{err}");
+    }
+
+    #[test]
+    fn says_which_record_and_line_a_bad_letter_is_on() {
+        let err = parse(">one\nMSK\n>two\nMSKZ\n").unwrap_err().to_string();
+        assert!(err.contains("\"two\""), "{err}");
+        assert!(err.contains("line 4"), "{err}");
     }
 
     #[test]

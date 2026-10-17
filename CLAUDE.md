@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 **Codon Harmony** reverse-translates a protein and optimises the gene for a host's codon
-usage, removing features that make genes hard to synthesise or express.
+usage, removing features that make genes hard to synthesise or express. The CLI returns
+several ranked candidates per protein, not one gene; see *Candidates and the retry*.
 
 The optimiser is the **Rust engine in `src/`**. The Python package in `codon_harmony/`
 is the original implementation, kept as the reference and as an independent auditor of
@@ -18,15 +19,19 @@ original Codon Harmony.
 
 ```bash
 cargo build --release
-cargo test                        # 80 tests, about 2 s
+cargo test                        # 114 tests, about 5 min in debug
 cargo clippy --all-targets        # expected to be clean
 ./target/release/codon_harmony \
     --input proteins.fasta \
     --output genes.fasta \
-    --host-table tests/data/e_coli_316407.json
+    --host-table tests/data/e_coli_316407.json \
+    --report-json report.json
 ```
 
-Useful flags: `--max-relax 0` freezes the codon profile (no substitutions at all),
+Useful flags: `--candidates` and `--cai-threshold` size the candidate set and set the
+retry trigger, `--retry-max-relax` / `--retry-restarts` / `--composition-budget` tune
+the two runs, `--report-json` writes the machine-readable report,
+`--max-relax 0` freezes the codon profile (no substitutions at all),
 `--start-site-rule purine-run` restores the original start-site definition, and
 `--seed` / `--restarts` / `--threads` control the search. `--cycles` and
 `--inner-cycles` are accepted and ignored, with a warning: they described the old
@@ -41,10 +46,16 @@ trusted. There is no table download: pass a file.
 
 ```bash
 python scripts/validate.py proteins.fasta genes.fasta tests/data/e_coli_316407.json
+python scripts/validate.py proteins.fasta genes.fasta table.json report.json
 ```
 
-Re-derives translation, deviation and CAI from the Rust output using Biopython and the
-original package, so results are never self-certified.
+Re-derives translation, deviation, GC and CAI from the Rust output using Biopython and
+the original package, so results are never self-certified. Candidates map back to their
+source protein through the `source=` field in each description, not through the Rust
+tool's own grouping. Given the report as well, it also audits set size, distinctness,
+ranking, the deviation bound that applied, and whether the retry fired exactly when the
+declared policy says it should. Biopython's CAI divides by `len - 1` where the engine
+uses `len`, so the two numbers are labelled separately rather than compared.
 
 ### Python package
 
@@ -83,7 +94,8 @@ when no swap can clear a violation.
 ```
 src/code.rs                        base and codon encoding, genetic code
 src/host.rs                        table parsing, thresholding, CAI weights
-src/composition.rs                 apportionment, GC band, budget
+src/composition.rs                 apportionment, GC band, budget, composition search
+src/batch.rs                       candidate sets, ranking, the one-retry policy
 src/metrics.rs                     deviation, CAI, GC of a finished gene
 src/arrange/state.rs               SeqState, Move, and the View/Patch machinery
 src/arrange/search.rs              the search driver
@@ -111,6 +123,31 @@ src/fasta.rs  src/rng.rs  src/small.rs
   These are the backbone of the suite; do not add a constraint without them.
 - Restarts are reduced **deterministically** by index, so output never depends on thread
   scheduling. A seed must reproduce a run exactly.
+
+## Candidates and the retry
+
+Arrangement cannot change CAI, because every arrangement of one multiset has the same
+one. `composition::explore` therefore searches multisets too: a bounded beam over
+synonymous one-count transfers from the apportioned baseline and from the
+all-preferred-codon allocation, with a paired GC-repair proposal so a one-transfer
+barrier does not stop it. Intermediate states may break the limits; only compositions
+inside the deviation bound and the GC band are handed to arrangement, and the baseline
+is always among them, since arrangement can fail for one multiset and succeed for
+another. A spent budget is `search_exhausted`, never a claim that nothing else exists.
+
+`batch::run_record` arranges every offered composition (`optimise_all` keeps all the
+restarts rather than reducing to one), re-derives every metric from the finished
+sequence, admits only genes that translate exactly and leave no violation, deduplicates
+by complete DNA, and ranks by descending CAI, then ascending deviation, then the
+sequence itself. If nothing strictly exceeds the threshold it runs the whole thing once
+more under the retry policy and pools both runs, so a retry can never replace a better
+first-run candidate with a worse one. Two runs per protein, never three.
+
+Invariants here: the threshold is a trigger and a warning, never a filter, and equality
+does not pass; a complete low-CAI set exits zero while a short set or an empty one
+exits non-zero; a sequence is never duplicated to pad a set; random streams come from
+`stream_seed`, which mixes the base seed with the record, run and composition **indices**
+only, so output never depends on thread scheduling.
 
 ## Constraint definitions
 

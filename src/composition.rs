@@ -8,6 +8,8 @@
 //! to the counts summing to the number of positions, so it is the L1-optimal integer
 //! allocation of a synonymous group.
 
+use std::collections::HashSet;
+
 use crate::code::{codon_aa, codon_gc, codon_string, AaIdx, CodonIdx, N_AA, N_CODONS};
 use crate::host::HostTable;
 
@@ -19,6 +21,8 @@ pub struct Composition {
     pub deviation: f64,
     /// Whole-gene GC fraction implied by these counts.
     pub gc: f64,
+    /// Codon adaptation index implied by these counts. Arrangement cannot change it.
+    pub cai: f64,
     /// Deviation budget still available to the arrangement search.
     pub budget_left: f64,
     /// Codon moves spent pulling GC into its band.
@@ -190,6 +194,7 @@ pub fn build(
         counts,
         deviation,
         gc,
+        cai: crate::metrics::cai_of_counts(&counts, host),
         budget_left: (max_relax - deviation).max(0.0),
         gc_moves,
         gc_in_band,
@@ -269,6 +274,280 @@ fn best_gc_move(
         }
     }
     best.map(|(_, mv)| mv)
+}
+
+/// Limits on the bounded composition search. They are a budget, not a guarantee: a
+/// search that runs out reports `exhausted` rather than claiming no other multiset
+/// exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchLimits {
+    /// States carried from one round to the next.
+    pub beam_width: usize,
+    /// Total states expanded. This is the only depth limit: the search keeps
+    /// transferring counts until the budget is spent or the frontier empties.
+    pub max_expansions: usize,
+    /// Valid compositions handed on to arrangement.
+    pub max_compositions: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self { beam_width: 12, max_expansions: 2000, max_compositions: 8 }
+    }
+}
+
+/// What a bounded composition search found.
+#[derive(Debug, Clone)]
+pub struct Exploration {
+    /// Valid compositions, best first. Never empty: the baseline is always included.
+    pub compositions: Vec<Composition>,
+    /// States expanded, for reporting against the budget.
+    pub expansions: usize,
+    /// The budget ran out while the frontier still held states. This is search
+    /// exhaustion, not proof that nothing better exists.
+    pub exhausted: bool,
+    /// The whole-gene GC band that was asked for.
+    pub band: (f64, f64),
+    /// The deviation a composition, and any arrangement of it, must stay within.
+    pub dev_limit: f64,
+    /// How far outside its band the whole-gene GC may sit. Zero unless the baseline
+    /// itself could not reach the band within the deviation limit.
+    pub gc_limit: f64,
+}
+
+/// How far a GC fraction sits outside its band; zero inside it.
+pub fn gc_distance(gc: f64, band: (f64, f64)) -> f64 {
+    if gc < band.0 {
+        band.0 - gc
+    } else if gc > band.1 {
+        gc - band.1
+    } else {
+        0.0
+    }
+}
+
+/// Comparisons against a hard limit allow this much floating-point slack. It is far
+/// below any difference a single codon can make to either metric at gene length.
+pub const LIMIT_TOLERANCE: f64 = 1e-9;
+
+/// Several codon multisets for one protein, to be arranged and then ranked by CAI.
+///
+/// Every arrangement of one multiset has the same CAI, so searching arrangements alone
+/// cannot optimise it. This walks synonymous one-count transfers from the host-profile
+/// allocation and from a CAI-greedy allocation, keeping the compositions that stay
+/// inside the deviation limit and the GC band.
+///
+/// The deviation limit is `max_relax`, except that the baseline allocation is always
+/// admitted: largest-remainder apportionment is L1-optimal, so no multiset deviates
+/// less, and rejecting it over integer rounding would leave nothing to build.
+pub fn explore(
+    protein: &[AaIdx],
+    host: &HostTable,
+    max_relax: f64,
+    gc_band: (f64, f64),
+    limits: &SearchLimits,
+) -> Result<Exploration, CompositionError> {
+    let baseline = build(protein, host, max_relax, gc_band)?;
+    let dev_limit = max_relax.max(baseline.deviation);
+    let gc_limit = gc_distance(baseline.gc, gc_band);
+    let max_compositions = limits.max_compositions.max(1);
+
+    // `--max-relax 0` freezes the multiset. Arrangement still explores, but there is
+    // exactly one composition to arrange.
+    if max_relax <= 0.0 {
+        return Ok(Exploration {
+            compositions: vec![baseline],
+            expansions: 0,
+            exhausted: false,
+            band: gc_band,
+            dev_limit,
+            gc_limit,
+        });
+    }
+
+    let valid = |counts: &[u32; N_CODONS]| -> Option<Composition> {
+        let dev = deviation(counts, host);
+        let gc = gc_fraction(counts);
+        if !dev.is_finite() || !gc.is_finite() {
+            return None;
+        }
+        if dev > dev_limit + LIMIT_TOLERANCE {
+            return None;
+        }
+        if gc_distance(gc, gc_band) > gc_limit + LIMIT_TOLERANCE {
+            return None;
+        }
+        Some(Composition {
+            counts: *counts,
+            deviation: dev,
+            gc,
+            cai: crate::metrics::cai_of_counts(counts, host),
+            budget_left: (max_relax - dev).max(0.0),
+            gc_moves: 0,
+            gc_in_band: gc_distance(gc, gc_band) == 0.0,
+        })
+    };
+
+    // Rank: first how far a state is from being usable at all, then CAI, then profile
+    // deviation. The count vector breaks the last tie so the order never depends on
+    // discovery order.
+    let score = |counts: &[u32; N_CODONS]| -> (f64, f64, f64) {
+        let dev = deviation(counts, host);
+        let gc = gc_fraction(counts);
+        let slack = (dev - dev_limit).max(0.0)
+            + (gc_distance(gc, gc_band) - gc_limit).max(0.0);
+        (slack, -crate::metrics::cai_of_counts(counts, host), dev)
+    };
+    let better = |a: &(f64, f64, f64, [u32; N_CODONS]), b: &(f64, f64, f64, [u32; N_CODONS])| {
+        a.0.partial_cmp(&b.0)
+            .unwrap()
+            .then(a.1.partial_cmp(&b.1).unwrap())
+            .then(a.2.partial_cmp(&b.2).unwrap())
+            .then(a.3.cmp(&b.3))
+    };
+
+    let mut seen: HashSet<[u32; N_CODONS]> = HashSet::new();
+    let mut found: Vec<Composition> = Vec::new();
+    let record = |counts: &[u32; N_CODONS], found: &mut Vec<Composition>| {
+        if let Some(composition) = valid(counts) {
+            found.push(composition);
+        }
+    };
+
+    let mut frontier: Vec<[u32; N_CODONS]> = Vec::new();
+    for start in [baseline.counts, cai_greedy(protein, host)] {
+        if seen.insert(start) {
+            record(&start, &mut found);
+            frontier.push(start);
+        }
+    }
+
+    let mut expansions = 0usize;
+    let mut exhausted = false;
+    while !frontier.is_empty() && expansions < limits.max_expansions {
+        let mut next: Vec<(f64, f64, f64, [u32; N_CODONS])> = Vec::new();
+        for counts in std::mem::take(&mut frontier) {
+            if expansions >= limits.max_expansions {
+                exhausted = true;
+                break;
+            }
+            expansions += 1;
+            for child in transfers(&counts, host) {
+                if !seen.insert(child) {
+                    continue;
+                }
+                record(&child, &mut found);
+                let s = score(&child);
+                next.push((s.0, s.1, s.2, child));
+                // A transfer that buys CAI often pushes GC out of band. Offer the
+                // paired state that pays the cheapest synonymous move back, so the
+                // beam is not stopped by a barrier one transfer wide.
+                if gc_distance(gc_fraction(&child), gc_band) > gc_limit + LIMIT_TOLERANCE {
+                    let want_more_gc = gc_fraction(&child) < gc_band.0;
+                    if let Some(mv) = best_gc_move(&child, host, want_more_gc) {
+                        let mut paired = child;
+                        paired[mv.from as usize] -= 1;
+                        paired[mv.to as usize] += 1;
+                        if seen.insert(paired) {
+                            record(&paired, &mut found);
+                            let s = score(&paired);
+                            next.push((s.0, s.1, s.2, paired));
+                        }
+                    }
+                }
+            }
+        }
+        if expansions >= limits.max_expansions && !next.is_empty() {
+            exhausted = true;
+        }
+        next.sort_by(better);
+        next.truncate(limits.beam_width.max(1));
+        frontier = next.into_iter().map(|(_, _, _, counts)| counts).collect();
+        // Retained states are capped too: with a generous deviation limit most of the
+        // frontier's children are valid, and keeping every one of them would grow the
+        // memory with the budget rather than with what is returned.
+        if found.len() > 4 * max_compositions {
+            prune(&mut found, max_compositions);
+        }
+        if exhausted {
+            break;
+        }
+    }
+
+    prune(&mut found, max_compositions);
+    if !found.iter().any(|c| c.counts == baseline.counts) {
+        found.truncate(max_compositions.saturating_sub(1));
+        found.push(baseline);
+    }
+
+    Ok(Exploration {
+        compositions: found,
+        expansions,
+        exhausted,
+        band: gc_band,
+        dev_limit,
+        gc_limit,
+    })
+}
+
+/// Rank by descending CAI, then ascending deviation, then the count vector, drop
+/// repeats, and keep the best `keep`. Every key is a number or the counts themselves,
+/// so the order does not depend on the order states were discovered in.
+fn prune(found: &mut Vec<Composition>, keep: usize) {
+    found.sort_by(|a, b| {
+        b.cai
+            .partial_cmp(&a.cai)
+            .unwrap()
+            .then(a.deviation.partial_cmp(&b.deviation).unwrap())
+            .then(a.counts.cmp(&b.counts))
+    });
+    found.dedup_by(|a, b| a.counts == b.counts);
+    found.truncate(keep);
+}
+
+/// Every multiset one synonymous count transfer away.
+fn transfers(counts: &[u32; N_CODONS], host: &HostTable) -> Vec<[u32; N_CODONS]> {
+    let mut out = Vec::new();
+    for from in 0..N_CODONS as CodonIdx {
+        if counts[from as usize] == 0 {
+            continue;
+        }
+        for to in host.usable_synonyms(codon_aa(from)) {
+            if to == from {
+                continue;
+            }
+            let mut child = *counts;
+            child[from as usize] -= 1;
+            child[to as usize] += 1;
+            out.push(child);
+        }
+    }
+    out
+}
+
+/// Every residue on its host-preferred codon: the CAI ceiling, usually far outside the
+/// deviation limit, and useful only as the other end of the search.
+fn cai_greedy(protein: &[AaIdx], host: &HostTable) -> [u32; N_CODONS] {
+    let mut best: [Option<CodonIdx>; N_AA] = [None; N_AA];
+    for aa in 0..N_AA as AaIdx {
+        // Ties go to the lower codon index, so the allocation never depends on the
+        // order `usable_synonyms` happens to yield.
+        let mut pick = (-1.0f64, 0 as CodonIdx, false);
+        for codon in host.usable_synonyms(aa) {
+            let weight = host.weight(codon);
+            if !pick.2 || weight > pick.0 || (weight == pick.0 && codon < pick.1) {
+                pick = (weight, codon, true);
+            }
+        }
+        best[aa as usize] = pick.2.then_some(pick.1);
+    }
+    let mut counts = [0u32; N_CODONS];
+    for &aa in protein {
+        if let Some(codon) = best[aa as usize] {
+            counts[codon as usize] += 1;
+        }
+    }
+    counts
 }
 
 /// Human-readable summary of which codons the composition uses, for reporting.
@@ -578,5 +857,106 @@ mod tests {
             .map(|&c| comp.counts[c as usize])
             .sum();
         assert_eq!(stops, 1);
+    }
+
+    fn group_totals(counts: &[u32; N_CODONS]) -> [u32; N_AA] {
+        let mut totals = [0u32; N_AA];
+        for codon in 0..N_CODONS as CodonIdx {
+            totals[codon_aa(codon) as usize] += counts[codon as usize];
+        }
+        totals
+    }
+
+    #[test]
+    fn every_explored_composition_encodes_the_same_protein() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let found = explore(&seq, &host, 0.1, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        let baseline = build(&seq, &host, 0.1, (0.30, 0.65)).unwrap();
+        assert!(found.compositions.len() > 1, "the search should offer alternatives");
+        for composition in &found.compositions {
+            assert_eq!(
+                group_totals(&composition.counts),
+                group_totals(&baseline.counts),
+                "a transfer may only move a count within its synonymous group"
+            );
+            assert!(composition.deviation <= found.dev_limit + LIMIT_TOLERANCE);
+            assert!(gc_distance(composition.gc, found.band) <= found.gc_limit + LIMIT_TOLERANCE);
+            for codon in 0..N_CODONS as CodonIdx {
+                if composition.counts[codon as usize] > 0 {
+                    assert!(host.freq(codon) > 0.0, "only codons the host uses");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_baseline_is_always_offered_and_the_set_is_ranked_by_cai() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let baseline = build(&seq, &host, 0.1, (0.30, 0.65)).unwrap();
+        let found = explore(&seq, &host, 0.1, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        assert!(
+            found.compositions.iter().any(|c| c.counts == baseline.counts),
+            "arrangement can fail for the high-CAI multiset and succeed for the baseline"
+        );
+        for pair in found.compositions.windows(2) {
+            if pair[1].counts == baseline.counts {
+                continue; // the baseline is kept whatever its rank
+            }
+            assert!(pair[0].cai >= pair[1].cai - LIMIT_TOLERANCE);
+        }
+        assert!(
+            found.compositions[0].cai > baseline.cai,
+            "spending deviation should buy CAI: {} vs {}",
+            found.compositions[0].cai,
+            baseline.cai
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_freezes_the_composition() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let found = explore(&seq, &host, 0.0, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        assert_eq!(found.compositions.len(), 1);
+        assert_eq!(found.expansions, 0);
+        assert!(!found.exhausted);
+        assert_eq!(found.compositions[0].counts, build(&seq, &host, 0.0, (0.30, 0.65)).unwrap().counts);
+    }
+
+    #[test]
+    fn a_larger_limit_reaches_a_higher_cai() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let tight = explore(&seq, &host, 0.02, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        let loose = explore(&seq, &host, 0.20, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        assert!(
+            loose.compositions[0].cai > tight.compositions[0].cai,
+            "{} should beat {}",
+            loose.compositions[0].cai,
+            tight.compositions[0].cai
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_is_reported_as_exhaustion_not_impossibility() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let limits = SearchLimits { max_expansions: 5, ..SearchLimits::default() };
+        let found = explore(&seq, &host, 0.2, (0.30, 0.65), &limits).unwrap();
+        assert!(found.exhausted, "the budget was spent with states still to expand");
+        assert!(found.expansions <= 5);
+        assert!(!found.compositions.is_empty(), "what it did find is still returned");
+    }
+
+    #[test]
+    fn exploration_is_reproducible() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let once = explore(&seq, &host, 0.1, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        let twice = explore(&seq, &host, 0.1, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        let counts = |e: &Exploration| e.compositions.iter().map(|c| c.counts).collect::<Vec<_>>();
+        assert_eq!(counts(&once), counts(&twice));
     }
 }

@@ -555,17 +555,24 @@ fn best_substitution(
 
 /// Optimise one protein. Restarts run in parallel and the best is chosen
 /// deterministically, so the result does not depend on thread scheduling.
-pub fn optimise(
+/// Every restart's arrangement, best first.
+///
+/// Restarts of one composition share its multiset and so share its deviation and CAI,
+/// but they are different sequences, which is what a candidate set needs. Reducing to
+/// one outcome throws that away, so the reduction lives in `optimise` instead.
+pub fn optimise_all(
     protein: &[AaIdx],
     composition: &Composition,
     host: &HostTable,
     options: &Options,
-) -> Outcome {
+) -> Vec<Outcome> {
     let restarts = options.restarts.max(1);
     let mut outcomes: Vec<Outcome> = (0..restarts)
         .into_par_iter()
         .map(|restart| run_once(protein, composition, host, options, restart))
         .collect();
+    // Sorted by index-derived fields only, so the order never depends on which thread
+    // finished first.
     outcomes.sort_by(|a, b| {
         a.violations
             .cmp(&b.violations)
@@ -573,6 +580,18 @@ pub fn optimise(
             .then(b.cai.partial_cmp(&a.cai).unwrap())
             .then(a.restart.cmp(&b.restart))
     });
+    outcomes
+}
+
+/// The single best arrangement. The original one-outcome API, kept for callers that
+/// want one gene rather than a candidate set.
+pub fn optimise(
+    protein: &[AaIdx],
+    composition: &Composition,
+    host: &HostTable,
+    options: &Options,
+) -> Outcome {
+    let mut outcomes = optimise_all(protein, composition, host, options);
     outcomes.swap_remove(0)
 }
 
