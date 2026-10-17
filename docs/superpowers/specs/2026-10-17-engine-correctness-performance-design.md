@@ -2,9 +2,19 @@
 
 Date: 2026-10-17
 
-Status: proposed; this document does not implement the changes
+Status: partly implemented; see the status note below
 
 Reviewed baseline: `06061f40d4822b35795743900b5438235abbf161`
+
+> **Status.** The two correctness failures in section 2.1 were fixed in commit
+> `3402d01`, together with the quadratic report named in section 2.2. Each now has a
+> regression test in `tests/engine.rs`: `g_rich_stems_keep_their_mixed_wobble_matches`,
+> `a_positive_deviation_limit_is_never_exceeded` and
+> `the_repeat_report_stays_linear_in_the_number_of_copies`. Sections 2.1 and 2.2 are
+> kept as the record of what was wrong and how it was reproduced, so the reproducers
+> stay readable next to the tests. Everything else here — occurrence lists that still
+> grow with multiplicity, the separate scheduler, coordinated repair, and the phased
+> delivery in sections 3 to 6 — remains a proposal.
 
 ## 1. Problem and decision
 
@@ -51,9 +61,15 @@ rebuild does not perform another exact scan. For DNA `GGGGGGGAAATTTCTCCCCCAC`, t
 `GGGGGGGAAA` accepts target `TTTCTCCCCC` under the detector's own directional G-to-C/T
 rule. The baseline reports zero hairpin matches; a brute-force oracle counts one.
 
-The existing 80 tests pass despite these cases. `scripts/validate.py` independently
-recomputes translation, deviation and CAI, but does not check all sequence constraints
-or enforce the requested deviation bound. It is not a complete validity oracle.
+Both failures above are fixed as of commit `3402d01`; the suite that missed them now
+covers them directly. The wobble cap is gone, so all 2^g variants of a stem are
+enumerated, bounded at 2^10 because a stem is ten bases. The whole-gene GC correction
+now consults `max_relax` before each move and reports `gc_in_band: false` rather than
+spending past the limit.
+
+`scripts/validate.py` still independently recomputes translation, deviation and CAI
+only: it does not check all sequence constraints, so it remains an incomplete validity
+oracle, which is the gap section 3 addresses.
 
 ### 2.2 Complexity and search limitations found in the code
 

@@ -36,10 +36,12 @@ are placed. The two halves separate:
   profile. Budget is spent on codon substitutions only when no swap can clear a
   violation.
 
-Constraints are evaluated incrementally. Fixed-window checks have bounded local work,
-but repeat/hairpin indices and diagnostic queues still have costs that grow with
-occurrence multiplicity. The [correctness and performance design](docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md)
-documents those limits and proposes bounded-memory replacements.
+Constraints are evaluated incrementally. Fixed-window checks do a bounded amount of
+local work, but an index does not by itself make a non-local constraint constant time:
+a 9-mer that occurs many times still has an occurrence list that grows with it. The
+[correctness and performance design](docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md)
+records which of those limits have been fixed and proposes bounded-memory replacements
+for the rest.
 
 ## Results
 

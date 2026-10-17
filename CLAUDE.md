@@ -98,8 +98,8 @@ src/fasta.rs  src/rng.rs  src/small.rs
   violation total. `apply` then folds the same move in.
 - **Evaluate affected dependencies incrementally and state their actual cost.** Fixed
   windows have bounded local work, but an index does not by itself make a nonlocal
-  constraint O(1). Occurrence-list traversal, long runs and expanded reports still
-  grow with sequence length or multiplicity; see the corrective design below.
+  constraint O(1): occurrence-list traversal and long runs still grow with multiplicity.
+  Reports are linear in the violations as of commit 3402d01. See the corrective design.
 - **Touched positions are kept sorted** (`sorted_positions` in `state.rs`). Constraints
   merge adjacent regions as they walk that list, so an unsorted pair silently drops a
   region. This caused every incremental test to fail once already.
