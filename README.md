@@ -36,13 +36,16 @@ are placed. The two halves separate:
   profile. Budget is spent on codon substitutions only when no swap can clear a
   violation.
 
-Every constraint is evaluated incrementally, so a move costs O(1) regardless of gene
-length.
+Constraints are evaluated incrementally. Fixed-window checks have bounded local work,
+but repeat/hairpin indices and diagnostic queues still have costs that grow with
+occurrence multiplicity. The [correctness and performance design](docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md)
+documents those limits and proposes bounded-memory replacements.
 
 ## Results
 
-Measured on the same machine and host table, with `scripts/validate.py` re-deriving
-every figure from the Rust output using the original Python package.
+Historical measurements on the same machine and host table. `scripts/validate.py`
+independently recomputes translation, deviation and CAI; it does not validate every
+sequence constraint or enforce the requested deviation limit.
 
 | GFP, 238 residues | Python, 10x10 | Rust |
 |---|---|---|
@@ -57,10 +60,10 @@ Scaling, single thread, random proteins of realistic composition: 1600 aa 1.05 s
 the Python's 2.0.
 
 Anything the engine cannot fix is reported with its position and cause, and the process
-exits non-zero. A search that stops is not a proof of infeasibility, though some cases
-provably are: three consecutive methionines are ATG ATG ATG in every encoding, and four
-lysines with three AAA in the multiset give six consecutive A's however they are
-arranged. Highly repetitive proteins are merely hard, not proven impossible.
+exits non-zero. A search that stops is not a proof of infeasibility, and other failed
+cases may still have a feasible arrangement. Some are provably impossible: three
+consecutive methionines are ATG ATG ATG in every encoding, and four lysines with three
+AAA in the multiset give six consecutive A's however they are arranged.
 
 ## Usage
 
@@ -106,6 +109,9 @@ are reproducible from a seed, and that the search only stops where no single mov
 
 ## Design documents
 
+- [Correctness and performance proposal](docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md) -
+  corrections to the validity contract, bounded-memory indices, coordinated repair,
+  delivery phases and validation gates; [reproducible evidence](docs/benchmarks/2026-10-17-engine-review/README.md).
 - [Design](docs/superpowers/specs/2026-10-17-codon-harmony-rust-redesign-design.md) -
   the measured problems, the approach, the constraint definitions and the results.
 - [Implementation plan](docs/superpowers/plans/2026-10-17-codon-harmony-rust-redesign.md) -

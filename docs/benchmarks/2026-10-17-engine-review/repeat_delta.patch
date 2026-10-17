@@ -1,0 +1,38 @@
+diff --git a/src/arrange/constraints/repeat.rs b/src/arrange/constraints/repeat.rs
+index 11e0366..c9b8b97 100644
+--- a/src/arrange/constraints/repeat.rs
++++ b/src/arrange/constraints/repeat.rs
+@@ -131,18 +131,25 @@ impl Repeats {
+             let empty: Vec<u32> = Vec::new();
+             let current = self.index.get(&key).unwrap_or(&empty);
+             let was = Self::contribution(current);
+-            let mut next: Vec<u32> = current
+-                .iter()
+-                .copied()
+-                .filter(|p| !edits.iter().any(|&(e, arriving)| !arriving && e == *p))
+-                .collect();
++            // Only count and extrema determine the repeated-key contribution.
++            // At most 22 starts are touched by a two-codon edit, regardless of N.
++            let removed = |p: &u32| edits.iter().any(|&(e, arriving)| !arriving && e == *p);
++            let leaving = edits.iter().filter(|(_, arriving)| !arriving).count();
++            let arriving = edits.len() - leaving;
++            let next_len = current.len() - leaving + arriving;
++            let mut lo = current.iter().find(|p| !removed(p)).copied();
++            let mut hi = current.iter().rev().find(|p| !removed(p)).copied();
+             for &(at, arriving) in &edits {
+                 if arriving {
+-                    next.push(at);
++                    lo = Some(lo.map_or(at, |p| p.min(at)));
++                    hi = Some(hi.map_or(at, |p| p.max(at)));
+                 }
+             }
+-            next.sort_unstable();
+-            delta += Self::contribution(&next) as i32 - was as i32;
++            let now = match (lo, hi) {
++                (Some(lo), Some(hi)) if hi - lo >= MIN_GAP as u32 => next_len as u32,
++                _ => 0,
++            };
++            delta += now as i32 - was as i32;
+         }
+         delta
+     }

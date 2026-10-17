@@ -1,0 +1,14 @@
+repeat_delta,aa,baseline_ns,prototype_ns,speedup
+repeat_delta,100,4418,1313,3.36
+repeat_delta,400,5710,1052,5.43
+repeat_delta,1600,15797,1087,14.53
+repeat_delta,6400,55937,1052,53.16
+differential_repeat_moves,20000,passed
+hairpin_wobble,reported=0,oracle=1
+hairpin_report,aa=100,entries=4380,micros=398
+repeat_report,aa=100,detail_bytes=204400,micros=61
+hairpin_report,aa=200,entries=17760,micros=1321
+repeat_report,aa=200,detail_bytes=858400,micros=192
+hairpin_report,aa=400,entries=71520,micros=5152
+repeat_report,aa=400,detail_bytes=3631428,micros=587
+max_relax,requested=0.001,composition_deviation=0.008333333333333333,budget_left=0

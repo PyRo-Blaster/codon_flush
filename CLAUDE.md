@@ -96,9 +96,10 @@ src/fasta.rs  src/rng.rs  src/small.rs
 - **`Constraint::delta` must not mutate anything.** It is handed a `before` and an
   `after` view of the same pre-move state and must return the exact change in the
   violation total. `apply` then folds the same move in.
-- **A constraint may only examine a constant-sized neighbourhood.** That is what keeps a
-  move O(1) in the gene's length. Repeats and hairpins are not local properties, so they
-  keep k-mer indices instead of scanning.
+- **Evaluate affected dependencies incrementally and state their actual cost.** Fixed
+  windows have bounded local work, but an index does not by itself make a nonlocal
+  constraint O(1). Occurrence-list traversal, long runs and expanded reports still
+  grow with sequence length or multiplicity; see the corrective design below.
 - **Touched positions are kept sorted** (`sorted_positions` in `state.rs`). Constraints
   merge adjacent regions as they walk that list, so an unsorted pair silently drops a
   region. This caused every incremental test to fail once already.
@@ -121,13 +122,19 @@ TTG; the original purine-run rule is still selectable. Repeats, hairpins, restri
 sites and splice motifs keep their original meanings.
 
 Constraints the engine cannot satisfy are reported with position and cause, and the
-process exits non-zero. A stopped search is not a proof of infeasibility. Some cases are
-provably impossible: three consecutive methionines are ATG ATG ATG in every encoding,
-and four lysines with three AAA in the multiset give six consecutive A's however they
-are arranged. Repetitive proteins are hard rather than proven impossible.
+process exits non-zero. A capped search failure is not proof of infeasibility: other
+failed cases may still have a feasible arrangement. Some are provably impossible, such
+as three consecutive methionines, which are ATG ATG ATG in every encoding, and four
+lysines with three AAA in the multiset, which give six consecutive A's however they are
+arranged.
 
 ## Design documents
 
+- `docs/superpowers/specs/2026-10-17-engine-correctness-performance-design.md` — proposed
+  corrections to validity and complexity claims, bounded-memory scoring/scheduling,
+  coordinated repair and phased validation. This is a proposal, not implemented behavior.
+- `docs/benchmarks/2026-10-17-engine-review/README.md` — baseline/prototype evidence and
+  reproduction instructions, including known positive-limit and hairpin failures.
 - `docs/superpowers/specs/2026-10-17-codon-harmony-rust-redesign-design.md` — the
   measured problems with the original, the approach, and the results.
 - `docs/superpowers/plans/2026-10-17-codon-harmony-rust-redesign.md` — the task
