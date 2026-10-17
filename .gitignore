@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Python build and cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local tool settings and OS cruft
+.claude/
+.DS_Store
+
+# Generated sequences
+out.fasta
+failed_seqs.fasta
