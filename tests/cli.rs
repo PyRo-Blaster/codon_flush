@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use codon_harmony_core::testdata::{ECOLI_TABLE, GFP};
+use codon_harmony_core::testdata::{ECOLI_TABLE, GFP, STRESS};
 
 /// A directory of this test's own, under the target directory so `cargo clean`
 /// removes it.
@@ -400,4 +400,178 @@ fn two_spellings_of_one_output_path_are_refused_before_anything_is_written() {
         !real.join("genes.fasta").exists(),
         "nothing may be created once the destinations collide"
     );
+}
+
+// --- the donor/acceptor pair rule -----------------------------------------------
+
+/// A protein carrying `WYV`, one of the 30 tripeptides that force a splice donor in
+/// every synonymous encoding. The IgG1 constant regions that prompted this contain
+/// such tripeptides; this stands in for them without pulling a sequence off the net.
+fn forced_donor_protein() -> String {
+    format!("{}WYV{}", &GFP[..60], &GFP[60..120])
+}
+
+#[test]
+fn the_default_rule_still_refuses_a_gene_it_cannot_clear() {
+    let dir = workspace("nomotif");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    write(&input, &format!(">forced\n{}\n", forced_donor_protein()));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--quiet",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "no-motif is unchanged and still hard");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no valid candidate"), "{stderr}");
+    // and the count is of sites, not of pattern hits: one forced donor reads as one
+    assert!(stderr.contains("splice motif x1"), "{stderr}");
+}
+
+#[test]
+fn the_pair_rule_builds_the_gene_and_discloses_what_it_kept() {
+    let dir = workspace("nopair");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    let report_path = dir.join("r.json");
+    write(&input, &format!(">forced\n{}\n", forced_donor_protein()));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", report_path.to_str().unwrap(),
+        "--splice-rule", "no-pair",
+        "--quiet",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let written = records(&std::fs::read_to_string(&output).unwrap());
+    assert_eq!(written.len(), 5, "the protein is buildable once lone donors are allowed");
+
+    let report = report_of(&report_path);
+    assert_eq!(report["splice_rule"], "no-pair");
+    let candidates = report["records"][0]["candidates"].as_array().unwrap();
+    for (rank, candidate) in candidates.iter().enumerate() {
+        let sites = candidate["retained_splice_sites"].as_array().unwrap();
+        assert!(!sites.is_empty(), "a forced donor must be disclosed, not hidden");
+        // every retained site is a lone half site: never both kinds in one gene
+        let donors = sites.iter().filter(|s| s["kind"] == "donor").count();
+        let acceptors = sites.iter().filter(|s| s["kind"] == "acceptor").count();
+        assert!(
+            donors == 0 || acceptors == 0,
+            "a donor and an acceptor together is what the rule forbids: {sites:?}"
+        );
+        for site in sites {
+            assert!(site["at"].as_u64().unwrap() >= 1, "positions are 1-based");
+            assert!(!site["sequence"].as_str().unwrap().is_empty());
+        }
+        // and the header carries the same disclosure
+        let (header, _) = &written[rank];
+        assert!(header.contains("retained_splice_sites="), "{header}");
+        assert!(header.contains("donor@"), "{header}");
+    }
+}
+
+#[test]
+fn the_pair_rule_still_refuses_a_donor_and_an_acceptor_together() {
+    // STRESS has motifs of both kinds that no arrangement clears, so even the
+    // weaker rule must reject it rather than shipping a spliceable gene.
+    let dir = workspace("nopair_pair");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    let report_path = dir.join("r.json");
+    write(&input, &format!(">stress\n{STRESS}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", report_path.to_str().unwrap(),
+        "--splice-rule", "no-pair",
+        "--quiet",
+    ]);
+    // whatever it manages, nothing written may carry both halves of a pair
+    let report = report_of(&report_path);
+    for record in report["records"].as_array().unwrap() {
+        for candidate in record["candidates"].as_array().unwrap() {
+            let sites = candidate["retained_splice_sites"].as_array().unwrap();
+            let donors = sites.iter().filter(|s| s["kind"] == "donor").count();
+            let acceptors = sites.iter().filter(|s| s["kind"] == "acceptor").count();
+            assert!(donors == 0 || acceptors == 0, "{sites:?}");
+        }
+    }
+    let _ = out;
+}
+
+#[test]
+fn the_default_rule_leaves_a_clean_gene_with_no_half_sites_at_all() {
+    let dir = workspace("clean");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    let report_path = dir.join("r.json");
+    write(&input, &format!(">gfp\n{GFP}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", report_path.to_str().unwrap(),
+        "--quiet",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = report_of(&report_path);
+    for candidate in report["records"][0]["candidates"].as_array().unwrap() {
+        assert!(candidate["retained_splice_sites"].as_array().unwrap().is_empty());
+    }
+    for (header, _) in records(&std::fs::read_to_string(&output).unwrap()) {
+        assert!(!header.contains("retained_splice_sites"), "{header}");
+    }
+}
+
+#[test]
+fn the_pair_rule_keeps_half_sites_a_clean_run_would_have_removed() {
+    // Worth pinning down, because it is the cost of the weaker rule and the reason
+    // it is opt-in: once a gene has no acceptors the objective is flat, so the
+    // search stops removing donors it could have avoided. GFP is spotless under
+    // the default and carries lone donors under the pair rule.
+    let dir = workspace("pair_cost");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    let report_path = dir.join("r.json");
+    write(&input, &format!(">gfp\n{GFP}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", report_path.to_str().unwrap(),
+        "--splice-rule", "no-pair",
+        "--quiet",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = report_of(&report_path);
+    let candidates = report["records"][0]["candidates"].as_array().unwrap();
+    let kept: Vec<usize> = candidates
+        .iter()
+        .map(|c| c["retained_splice_sites"].as_array().unwrap().len())
+        .collect();
+    assert!(kept.iter().any(|&n| n > 0), "the weaker rule does keep half sites");
+    for candidate in candidates {
+        let sites = candidate["retained_splice_sites"].as_array().unwrap();
+        let donors = sites.iter().filter(|s| s["kind"] == "donor").count();
+        let acceptors = sites.iter().filter(|s| s["kind"] == "acceptor").count();
+        assert!(donors == 0 || acceptors == 0, "never both halves: {sites:?}");
+    }
+    // every one of them is named in the header, never silently carried
+    for ((header, _), n) in records(&std::fs::read_to_string(&output).unwrap()).iter().zip(&kept) {
+        assert_eq!(header.contains("retained_splice_sites="), *n > 0, "{header}");
+    }
+    // and among candidates of equal CAI and deviation, fewer half sites ranks first
+    for pair in candidates.windows(2) {
+        let same = pair[0]["cai"] == pair[1]["cai"] && pair[0]["deviation"] == pair[1]["deviation"];
+        if same {
+            let a = pair[0]["retained_splice_sites"].as_array().unwrap().len();
+            let b = pair[1]["retained_splice_sites"].as_array().unwrap().len();
+            assert!(a <= b, "equally good genes should be ordered fewest half sites first");
+        }
+    }
 }

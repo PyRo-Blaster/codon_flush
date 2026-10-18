@@ -152,6 +152,9 @@ cargo build --release
 
 Useful options:
 
+- `--splice-rule` chooses what counts as a splice problem. The default, `no-motif`,
+  rejects every donor and every acceptor. `no-pair` rejects only a donor and an
+  acceptor *together*. See *Splice sites that no encoding can avoid* below.
 - `--max-relax 0` freezes the profile: no substitution is ever made, so deviation stays
   at the apportionment optimum and the CAI is identical across every seed and restart.
   It stays frozen on the retry, which then buys arrangement effort only; an explicit
@@ -168,6 +171,47 @@ normalised to DNA, and a codon filed under the wrong amino acid is rejected rath
 than renormalised into the wrong group. The table must be complete: every amino acid
 and the stop codons need at least one codon the threshold leaves usable.
 `tests/data/e_coli_316407.json` is a full working export and doubles as the example.
+
+## Splice sites that no encoding can avoid
+
+Thirty tripeptides force a splice donor in **every** synonymous encoding:
+
+```
+{M, W} x {C, W, Y} x {A, D, E, G, V}
+```
+
+M is `ATG` and W is `TGG`, so both end in G with no alternative; C, W and Y all begin
+`T` with A or G second; A, D, E, G and V all begin with G. The nine-base window is
+therefore forced to `??G|T[AG]?|G??`, which matches the donor consensus `..GT[AG].G.`
+whatever synonyms are chosen. The GT that defines a donor straddles a codon boundary,
+where no synonymous substitution reaches. This is a property of the genetic code, not
+of the host table: the same 30 come out with every codon available. Nothing forces an
+*acceptor* — across all 160,000 four-residue peptides and every encoding of each,
+there is always an escape.
+
+Antibody constant regions contain these tripeptides, so under the default rule the
+engine correctly reports that it cannot build them. `--splice-rule no-pair` is the way
+through. Splicing needs a pair: a 5' donor and a downstream 3' acceptor define an
+intron, so a lone half site cannot be spliced out of the coding sequence. Under
+`no-pair` the engine clears every acceptor — always possible — and keeps the donors it
+cannot avoid. `grep -oE "[MW][CWY][ADEGV]"` on a protein finds them.
+
+**The caveat, which is why this is opt-in.** A lone donor is inert only relative to the
+coding sequence. A transgene is expressed from a vector, and a donor inside the insert
+can still pair with an acceptor downstream in the vector's expression cassette — the
+usual mammalian arrangement, and exactly the context `--remove-splice-sites` is for. So
+every retained site is reported with its position and kind, in the FASTA description
+(`retained_splice_sites=donor@27,donor@117`) and per candidate in the JSON, so the gene
+can be checked against the vector it is going into.
+
+A second cost: `no-pair` does not *minimise* half sites, it only forbids pairs. Once a
+gene has no acceptors the objective is flat, so the search stops removing donors it
+could have avoided — GFP is spotless under the default and carries lone donors under
+`no-pair`. Among candidates of equal CAI and deviation the one with fewer is ranked
+first, but the rule is for proteins that need it, not a better default.
+
+Counting is per site, not per pattern. The 20 donor patterns overlap heavily, so one
+eight-base window can match several; it is one site, and is counted and reported once.
 
 ## Verifying the output
 
@@ -198,7 +242,7 @@ last digits rather than to match.
 
 ## Tests
 
-`cargo test` runs 126 tests, and `pytest tests/test_validate_audit.py` runs 13 more
+`cargo test` runs 138 tests, and `pytest tests/test_validate_audit.py` runs 13 more
 against the auditor itself. The backbone is differential: every constraint detector is
 checked against a brute-force oracle on random sequences, and its incremental
 bookkeeping is checked against a full rebuild after every move across 20,000 random
