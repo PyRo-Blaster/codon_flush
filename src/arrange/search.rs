@@ -42,6 +42,10 @@ pub struct Options {
     pub remove_start_sites: bool,
     pub start_site_rule: start_site::Rule,
     pub remove_splice_sites: bool,
+    /// Whole-gene GC bounds. Swaps cannot move whole-gene GC, but substitutions
+    /// change the multiset and so can walk it out of the band; this keeps them
+    /// inside it rather than leaving acceptance to throw the arrangement away.
+    pub gc_band: (f64, f64),
 }
 
 impl Default for Options {
@@ -63,6 +67,7 @@ impl Default for Options {
             remove_start_sites: true,
             start_site_rule: start_site::Rule::ShineDalgarno,
             remove_splice_sites: true,
+            gc_band: (0.30, 0.65),
         }
     }
 }
@@ -323,7 +328,10 @@ fn run_once(
             };
             if chosen.is_none() {
                 if let Some(candidate) =
-                    best_substitution(&state, &constraints, host, &positions, composition, 0)
+                    best_substitution(
+                        &state, &constraints, host, &positions, composition,
+                        options.gc_band, 0,
+                    )
                 {
                     substitutions += 1;
                     chosen = Some(candidate.mv);
@@ -335,6 +343,7 @@ fn run_once(
                     host,
                     &positions,
                     composition,
+                    options.gc_band,
                     options.exhaustive_cap,
                 ) {
                     // two coordinated substitutions were needed, and they paid off
@@ -450,9 +459,11 @@ fn try_paired_substitution(
     host: &HostTable,
     positions: &[u32],
     composition: &Composition,
+    gc_band: (f64, f64),
     cap: usize,
 ) -> bool {
-    let Some(holding) = best_substitution(state, constraints, host, positions, composition, 1)
+    let Some(holding) =
+        best_substitution(state, constraints, host, positions, composition, gc_band, 1)
     else {
         return false;
     };
@@ -465,7 +476,9 @@ fn try_paired_substitution(
     let follow = exhaustive_swaps(state, constraints, positions, cap)
         .0
         .filter(|c| c.delta < 0)
-        .or_else(|| best_substitution(state, constraints, host, positions, composition, 0));
+        .or_else(|| {
+            best_substitution(state, constraints, host, positions, composition, gc_band, 0)
+        });
     match follow {
         Some(candidate) => {
             apply(state, constraints, candidate.mv);
@@ -509,12 +522,14 @@ fn apply(state: &mut SeqState, constraints: &mut ConstraintSet, mv: Move) {
 }
 
 /// The cheapest substitution that clears violations without overrunning the budget.
+#[allow(clippy::too_many_arguments)]
 fn best_substitution(
     state: &SeqState,
     constraints: &ConstraintSet,
     host: &HostTable,
     positions: &[u32],
     composition: &Composition,
+    gc_band: (f64, f64),
     allow_above: i32,
 ) -> Option<Candidate> {
     if composition.budget_left <= 0.0 {
@@ -534,6 +549,13 @@ fn best_substitution(
             counts[codon as usize] += 1;
             let deviation = crate::composition::deviation(&counts, host);
             if deviation > budget {
+                continue;
+            }
+            // The band is the caller's requirement, not a preference, so a
+            // substitution that leaves it is not available however much it would
+            // buy elsewhere.
+            let gc = crate::composition::gc_fraction(&counts);
+            if gc < gc_band.0 || gc > gc_band.1 {
                 continue;
             }
             let mv = Move::Subst { p, codon };

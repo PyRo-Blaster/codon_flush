@@ -87,10 +87,9 @@ pub struct Candidate {
     /// The deviation the run asked to be allowed. A retry candidate may legitimately
     /// exceed the first run's.
     pub max_relax: f64,
-    /// The deviation bound actually applied. It is `max_relax`, except that the
-    /// largest-remainder baseline is always admitted: no multiset deviates less, so a
-    /// short protein whose integer rounding alone exceeds the limit is still built,
-    /// against this bound rather than a silently enlarged one.
+    /// The deviation bound actually applied. For a positive `max_relax` it is that
+    /// limit exactly. For a frozen composition it is the integer-rounding deviation
+    /// the frozen multiset already has, which no multiset can beat.
     pub dev_limit: f64,
     pub moves: usize,
     pub substitutions: usize,
@@ -111,6 +110,9 @@ pub struct Attempt {
     /// further distinct encoding exists.
     pub search_exhausted: bool,
     pub arrangements: usize,
+    /// Passes over the compositions. More than one means restarts alone could not
+    /// fill the candidate set.
+    pub rounds: usize,
     pub valid: usize,
     pub best_cai: Option<f64>,
     /// Why the arrangements that were turned away were turned away. Without this a
@@ -189,13 +191,20 @@ impl RecordReport {
     }
 }
 
+/// How many arrangements a run may try per candidate asked for, when restarts alone
+/// cannot fill the set. Eight is enough to find five distinct sequences for a frozen
+/// composition in the cases measured, and bounds the work for a protein that simply
+/// has fewer encodings than were asked for.
+const ARRANGEMENT_SURPLUS: usize = 8;
+
 /// Mix stable indices into a stream seed. Index arithmetic only: no hashing of names,
 /// no thread identity, so the same seed reproduces a run whatever the thread count.
-pub fn stream_seed(base: u64, record: usize, run: u8, composition: usize) -> u64 {
+pub fn stream_seed(base: u64, record: usize, run: u8, composition: usize, round: usize) -> u64 {
     let mut z = base
         ^ (record as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (run as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-        ^ (composition as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        ^ (composition as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (round as u64).wrapping_mul(0xA0761D6478BD642F);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -241,7 +250,7 @@ pub fn run_record(
 
         let attempt = collect(
             index, protein, host, options, &exploration, run, max_relax, restarts, expansions,
-            &mut pool,
+            wanted, &mut pool,
         );
         report.search_exhausted |= attempt.search_exhausted;
         report.attempts.push(attempt);
@@ -290,6 +299,7 @@ fn collect(
     max_relax: f64,
     restarts: usize,
     expansion_budget: usize,
+    wanted: usize,
     pool: &mut Vec<Candidate>,
 ) -> Attempt {
     let mut attempt = Attempt {
@@ -302,6 +312,7 @@ fn collect(
         expansions: exploration.expansions,
         search_exhausted: exploration.exhausted,
         arrangements: 0,
+        rounds: 0,
         valid: 0,
         best_cai: None,
         rejected: Rejections::default(),
@@ -310,29 +321,58 @@ fn collect(
     // Every composition the search offered is arranged, so the candidate set depends
     // on the search budget and not on the threshold: a low threshold must not buy a
     // worse set of genes than a high one.
-    for (composition_index, composition) in exploration.compositions.iter().enumerate() {
-        let seed = stream_seed(options.arrange.seed, index, run, composition_index);
-        let arrange = Options { seed, restarts, ..options.arrange.clone() };
-        for outcome in optimise_all(protein, composition, host, &arrange) {
-            attempt.arrangements += 1;
-            let candidate = match accept(
-                protein, &outcome, exploration, run, composition_index, seed, max_relax,
-            ) {
-                Ok(candidate) => candidate,
-                Err(reason) => {
-                    note(&mut attempt.rejected, reason, &outcome);
-                    continue;
-                }
+    //
+    // Restarts alone cannot always fill the set. A frozen composition is one
+    // multiset, so four restarts give at most four sequences however many were
+    // asked for, and deduplication can leave fewer still. So the run keeps going on
+    // fresh streams until the set is full or the surplus is spent, rather than
+    // reporting a shortage the caller could only fix by passing --restarts again.
+    let budget = (ARRANGEMENT_SURPLUS * wanted)
+        .max(restarts.saturating_mul(exploration.compositions.len()));
+    let mut round = 0usize;
+    while !exploration.compositions.is_empty() && attempt.arrangements < budget {
+        for (composition_index, composition) in exploration.compositions.iter().enumerate() {
+            let seed = stream_seed(options.arrange.seed, index, run, composition_index, round);
+            let arrange = Options {
+                seed,
+                restarts,
+                gc_band: options.gc_band,
+                ..options.arrange.clone()
             };
-            attempt.valid += 1;
-            attempt.best_cai = Some(match attempt.best_cai {
-                Some(best) if best >= candidate.cai => best,
-                _ => candidate.cai,
-            });
-            pool.push(candidate);
+            for outcome in optimise_all(protein, composition, host, &arrange) {
+                attempt.arrangements += 1;
+                let candidate = match accept(
+                    protein, &outcome, exploration, run, composition_index, seed, max_relax,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        note(&mut attempt.rejected, reason, &outcome);
+                        continue;
+                    }
+                };
+                attempt.valid += 1;
+                attempt.best_cai = Some(match attempt.best_cai {
+                    Some(best) if best >= candidate.cai => best,
+                    _ => candidate.cai,
+                });
+                pool.push(candidate);
+            }
+        }
+        round += 1;
+        if distinct(pool) >= wanted {
+            break;
         }
     }
+    attempt.rounds = round;
     attempt
+}
+
+/// Distinct genes in the pool, which is what a full candidate set means.
+fn distinct(pool: &[Candidate]) -> usize {
+    let mut genes: Vec<&str> = pool.iter().map(|c| c.dna.as_str()).collect();
+    genes.sort_unstable();
+    genes.dedup();
+    genes.len()
 }
 
 /// Why an arrangement was not admitted.
@@ -389,8 +429,11 @@ fn accept(
     if !cai.is_finite() || !deviation.is_finite() || !gc.is_finite() {
         return Err(Reject::Unsound);
     }
+    // Both bounds are hard, and arrangement can break either: a substitution
+    // changes the multiset, so it moves deviation and whole-gene GC alike. A
+    // low-CAI fallback is still a gene that has to meet what was asked for.
     if deviation > exploration.dev_limit + LIMIT_TOLERANCE
-        || gc_distance(gc, exploration.band) > exploration.gc_limit + LIMIT_TOLERANCE
+        || gc_distance(gc, exploration.band) > LIMIT_TOLERANCE
     {
         return Err(Reject::OverLimit);
     }
@@ -484,7 +527,10 @@ mod tests {
         for candidate in &report.candidates {
             assert_eq!(candidate.dna.len(), protein.len() * 3);
             assert!(candidate.deviation <= candidate.dev_limit + LIMIT_TOLERANCE);
-            assert!(candidate.dev_limit >= options().max_relax);
+            assert!(
+                candidate.dev_limit <= candidate.max_relax + LIMIT_TOLERANCE,
+                "a positive limit is a hard bound, never widened"
+            );
             assert!(candidate.gc >= 0.30 && candidate.gc <= 0.65);
         }
     }
@@ -543,6 +589,78 @@ mod tests {
             forced.best_cai().unwrap() >= plain.best_cai().unwrap() - LIMIT_TOLERANCE,
             "pooling both runs cannot make the best candidate worse"
         );
+    }
+
+    #[test]
+    fn a_limit_below_the_rounding_floor_is_an_error_not_a_wider_limit() {
+        let host = host();
+        let protein = short();
+        let floor = run_record(0, &protein, &host, &options())
+            .candidates
+            .first()
+            .map(|c| c.dev_limit)
+            .unwrap();
+        let impossible = BatchOptions {
+            max_relax: 1e-6,
+            retry: RetryPolicy { max_relax: 1e-6, restarts: 8, expansions: 4000 },
+            ..options()
+        };
+        assert!(floor > 1e-6, "the short protein's rounding floor must exceed the limit");
+        let report = run_record(0, &protein, &host, &impossible);
+        assert_eq!(report.status, Status::Error);
+        assert!(report.candidates.is_empty());
+        let error = report.error.unwrap();
+        assert!(error.contains("smallest deviation"), "{error}");
+    }
+
+    #[test]
+    fn no_candidate_leaves_the_requested_gc_band() {
+        let host = host();
+        let narrow = BatchOptions { gc_band: (0.40, 0.50), ..options() };
+        let report = run_record(0, &short(), &host, &narrow);
+        assert!(!report.candidates.is_empty(), "{report:?}");
+        for candidate in &report.candidates {
+            assert!(
+                (0.40..=0.50).contains(&candidate.gc),
+                "GC {} left the requested band",
+                candidate.gc
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreachable_band_fails_rather_than_widening() {
+        let host = host();
+        let unreachable = BatchOptions {
+            gc_band: (0.95, 0.99),
+            max_relax: 0.01,
+            retry: RetryPolicy { max_relax: 0.01, restarts: 8, expansions: 4000 },
+            ..options()
+        };
+        let report = run_record(0, &short(), &host, &unreachable);
+        assert_eq!(report.status, Status::Error);
+        assert!(report.candidates.is_empty(), "no gene may be returned outside the band");
+    }
+
+    #[test]
+    fn a_frozen_run_keeps_generating_until_the_set_is_full() {
+        let host = host();
+        let frozen = BatchOptions {
+            max_relax: 0.0,
+            cai_threshold: 0.60, // the frozen multiset clears this, so there is no retry
+            retry: RetryPolicy::doubling(0.0, 4, 2000),
+            ..options()
+        };
+        let report = run_record(0, &protein(GFP), &host, &frozen);
+        assert_eq!(report.attempts.len(), 1, "filling the set is not a retry");
+        assert_eq!(report.status, Status::Ok, "{:?}", report.status);
+        assert_eq!(report.candidates.len(), 5);
+        assert!(
+            report.attempts[0].rounds > 1,
+            "one multiset and four restarts cannot give five distinct genes in one round"
+        );
+        let unique: HashSet<&str> = report.candidates.iter().map(|c| c.dna.as_str()).collect();
+        assert_eq!(unique.len(), 5);
     }
 
     #[test]
@@ -615,18 +733,23 @@ mod tests {
     }
 
     #[test]
-    fn streams_differ_by_record_run_and_composition() {
+    fn streams_differ_by_record_run_composition_and_round() {
         let seeds: HashSet<u64> = [
-            stream_seed(1, 0, 1, 0),
-            stream_seed(1, 1, 1, 0),
-            stream_seed(1, 0, 2, 0),
-            stream_seed(1, 0, 1, 1),
-            stream_seed(2, 0, 1, 0),
+            stream_seed(1, 0, 1, 0, 0),
+            stream_seed(1, 1, 1, 0, 0),
+            stream_seed(1, 0, 2, 0, 0),
+            stream_seed(1, 0, 1, 1, 0),
+            stream_seed(1, 0, 1, 0, 1),
+            stream_seed(2, 0, 1, 0, 0),
         ]
         .into_iter()
         .collect();
-        assert_eq!(seeds.len(), 5, "each index must move the stream");
-        assert_eq!(stream_seed(7, 2, 2, 3), stream_seed(7, 2, 2, 3), "and be reproducible");
+        assert_eq!(seeds.len(), 6, "each index must move the stream");
+        assert_eq!(
+            stream_seed(7, 2, 2, 3, 1),
+            stream_seed(7, 2, 2, 3, 1),
+            "and be reproducible"
+        );
     }
 
     #[test]

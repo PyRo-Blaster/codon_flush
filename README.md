@@ -126,10 +126,19 @@ the deviation, the GC and which run produced it; `--report-json` writes the same
 full precision, plus the policy, both runs' settings and outcomes, and every
 candidate's provenance.
 
-A short protein is the one case where the deviation bound is not `--max-relax`: the
-largest-remainder baseline is L1-optimal, so when its integer rounding alone costs more
-than the limit it is still admitted, and the bound that actually applied is reported as
-`dev_limit` rather than the limit being silently enlarged.
+Both limits are hard, for every candidate including the low-CAI fallback. A positive
+`--max-relax` bounds every composition and every substitution; the largest-remainder
+baseline is L1-optimal, so when even its integer rounding costs more than the limit,
+the run fails saying what the floor is rather than raising the bound to fit. The GC
+band is hard throughout composition search, arrangement and acceptance; a protein that
+cannot reach it within the deviation limit is an error, never a widened band. Only the
+CAI expectation is ever relaxed. `--max-relax 0` keeps its own meaning: the multiset is
+frozen and the integer-rounding deviation it already has is reported as `dev_limit`.
+
+The candidate count is a target the run works at, not a count of restarts. One frozen
+multiset with four restarts cannot yield five distinct genes, so a run that is short
+keeps arranging on fresh streams, up to a bounded surplus, before it reports a
+shortage. That is not a retry: the one-retry CAI rule is untouched.
 
 ## Usage
 
@@ -166,9 +175,17 @@ and the stop codons need at least one codon the threshold leaves usable.
 each candidate back to its source protein through the `source=` field rather than
 trusting the tool's grouping, and independently re-checks translation, deviation, GC
 and CAI using Biopython and the original Python package, so nothing is self-certified.
-Given the JSON report as well, it also checks that each set is distinct, ranked, no
-longer than was asked for, within the deviation bound that applied, and that the retry
-happened exactly when the declared policy says it should. It needs Biopython < 1.78.
+Every number it prints is re-derived from the sequence: translation and the legacy
+Biopython CAI need Biopython < 1.78, while GC and the engine-convention CAI are
+recomputed here from the host table. The claims in the FASTA descriptions and in the
+report are then checked *against* those, so a wrong CAI, a wrong ranking or an
+out-of-band sequence fails the audit instead of passing it. Given the report it also
+checks set size, distinctness, ranking by the recomputed CAI, the requested GC band,
+the deviation bound that applied, and whether the retry fired exactly when the declared
+policy says it should.
+
+`tests/test_validate_audit.py` feeds the auditor deliberately falsified reports and
+requires each to be caught; it needs pytest but not Biopython.
 
 ```
 python scripts/validate.py proteins.fasta genes.fasta tests/data/e_coli_316407.json
@@ -181,7 +198,8 @@ last digits rather than to match.
 
 ## Tests
 
-`cargo test` runs 114 tests. The backbone is differential: every constraint detector is
+`cargo test` runs 126 tests, and `pytest tests/test_validate_audit.py` runs 13 more
+against the auditor itself. The backbone is differential: every constraint detector is
 checked against a brute-force oracle on random sequences, and its incremental
 bookkeeping is checked against a full rebuild after every move across 20,000 random
 moves. Integration tests assert that the protein always survives, that the deviation

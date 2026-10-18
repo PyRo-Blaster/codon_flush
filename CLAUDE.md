@@ -19,7 +19,7 @@ original Codon Harmony.
 
 ```bash
 cargo build --release
-cargo test                        # 114 tests, about 5 min in debug
+cargo test                        # 126 tests, about 5 min in debug
 cargo clippy --all-targets        # expected to be clean
 ./target/release/codon_harmony \
     --input proteins.fasta \
@@ -54,13 +54,15 @@ python scripts/validate.py proteins.fasta genes.fasta tests/data/e_coli_316407.j
 python scripts/validate.py proteins.fasta genes.fasta table.json report.json
 ```
 
-Re-derives translation, deviation, GC and CAI from the Rust output using Biopython and
-the original package, so results are never self-certified. Candidates map back to their
-source protein through the `source=` field in each description, not through the Rust
-tool's own grouping. Given the report as well, it also audits set size, distinctness,
-ranking, the deviation bound that applied, and whether the retry fired exactly when the
-declared policy says it should. Biopython's CAI divides by `len - 1` where the engine
-uses `len`, so the two numbers are labelled separately rather than compared.
+Re-derives every number from the sequences and checks the engine's claims *against*
+them, rather than printing both and trusting the claim: a falsified CAI, a wrong
+ranking or an out-of-band sequence must fail the audit. Candidates map back to their
+source protein through the `source=` field, not through the Rust tool's grouping.
+Biopython's CAI divides by `len - 1` where the engine uses `len`, so it is a separate
+column and never what a claim is checked against; the engine-convention CAI is
+recomputed in plain Python from the host table and agrees with the Rust value to the
+last bit. The metric and audit helpers import nothing from Biopython, so
+`pytest tests/test_validate_audit.py` can exercise them on falsified input anywhere.
 
 ### Python package
 
@@ -151,8 +153,23 @@ first-run candidate with a worse one. Two runs per protein, never three.
 Invariants here: the threshold is a trigger and a warning, never a filter, and equality
 does not pass; a complete low-CAI set exits zero while a short set or an empty one
 exits non-zero; a sequence is never duplicated to pad a set; random streams come from
-`stream_seed`, which mixes the base seed with the record, run and composition **indices**
-only, so output never depends on thread scheduling.
+`stream_seed`, which mixes the base seed with the record, run, composition and round
+**indices** only, so output never depends on thread scheduling.
+
+**The deviation limit and the GC band are hard, everywhere.** A positive `--max-relax`
+bounds every composition, every substitution (`best_substitution` checks both) and
+final acceptance. The baseline is not exempt: when its rounding floor exceeds a
+positive limit the answer is `CompositionError::DeviationFloor`, not a wider limit, and
+nothing is written. The band is hard the same way, with `GcOutsideBudget` when it
+cannot be reached within the limit. Only the CAI expectation is ever relaxed, and
+`--max-relax 0` still freezes the multiset and reports its rounding deviation. Reviews
+have caught both of these being quietly widened; do not reintroduce
+`max_relax.max(baseline.deviation)` or a GC allowance inherited from the baseline.
+
+A run that is short of candidates keeps arranging on fresh streams up to
+`ARRANGEMENT_SURPLUS * wanted` attempts, because one frozen multiset with four restarts
+cannot give five distinct genes. That is not a retry; the one-retry CAI rule is
+separate.
 
 ## Constraint definitions
 

@@ -324,6 +324,7 @@ fn check(cli: &Cli) -> Result<BatchOptions> {
         arrange: Options {
             seed: cli.seed,
             restarts: cli.restarts,
+            gc_band: (cli.gc_low, cli.gc_high),
             homopolymer_limit: cli.local_homopolymer_threshold,
             enzymes: enzymes_from(&cli.restriction_enzymes)?,
             remove_start_sites: cli.remove_start_sites,
@@ -334,16 +335,28 @@ fn check(cli: &Cli) -> Result<BatchOptions> {
     })
 }
 
-/// Two settings naming the same file. Canonicalisation is best effort: an output file
-/// that does not exist yet still has to be compared with the input.
+/// Where a path will actually land, as far as can be known before the file exists.
+///
+/// Canonicalising the whole path fails for a file that is not there yet, which is the
+/// normal case for an output. Canonicalising the *parent* succeeds, which is what
+/// matters: two spellings of a directory that differ only through a symlink resolve
+/// to the same place, so `out/genes.fasta` and `link/genes.fasta` compare equal
+/// before either file is created.
+fn destination(path: &Path) -> PathBuf {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    match path.file_name() {
+        Some(name) => resolved.join(name),
+        None => resolved,
+    }
+}
+
+/// Two settings naming the same file.
 fn same_path(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    a == b || destination(a) == destination(b)
 }
 
 /// Write through a temporary sibling and rename. Each file lands whole or not at all;
@@ -502,8 +515,9 @@ fn tell(record: &Record, report: &RecordReport, cli: &Cli) {
             if attempt.search_exhausted { "  (budget spent)" } else { "" }
         );
         println!(
-            "         arrangements {}  valid {}  best CAI {}",
+            "         arrangements {} in {} round(s)  valid {}  best CAI {}",
             attempt.arrangements,
+            attempt.rounds,
             attempt.valid,
             attempt.best_cai.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".to_string())
         );
@@ -601,6 +615,7 @@ fn report_json(
                     "expansions": attempt.expansions,
                     "search_exhausted": attempt.search_exhausted,
                     "arrangements": attempt.arrangements,
+                    "rounds": attempt.rounds,
                     "valid": attempt.valid,
                     "best_cai": attempt.best_cai,
                     "rejected": {

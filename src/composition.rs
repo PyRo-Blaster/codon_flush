@@ -38,6 +38,11 @@ pub struct Composition {
 pub enum CompositionError {
     /// GC cannot reach the band by any synonymous reallocation.
     GcUnreachable { best: f64, band: (f64, f64) },
+    /// Even the L1-optimal allocation deviates more than a positive limit allows.
+    /// Integer rounding alone costs this much, so no multiset can do better.
+    DeviationFloor { best: f64, limit: f64 },
+    /// GC can reach the band, but not without deviating more than the limit allows.
+    GcOutsideBudget { best: f64, band: (f64, f64), limit: f64 },
     /// The protein has no residues.
     Empty,
 }
@@ -49,6 +54,22 @@ impl std::fmt::Display for CompositionError {
                 f,
                 "whole-gene GC cannot reach {:.0}-{:.0}% for this protein; the closest \
                  any synonymous choice gets is {:.1}%",
+                band.0 * 100.0,
+                band.1 * 100.0,
+                best * 100.0
+            ),
+            Self::DeviationFloor { best, limit } => write!(
+                f,
+                "the smallest deviation any codon multiset can have for this protein is \
+                 {best:.6}, above the requested limit of {limit:.6}; integer rounding of \
+                 the host profile alone costs that much, so raise --max-relax to at \
+                 least {best:.6}"
+            ),
+            Self::GcOutsideBudget { best, band, limit } => write!(
+                f,
+                "whole-gene GC cannot reach {:.0}-{:.0}% without deviating from the host \
+                 profile by more than the requested {limit:.6}; the closest any \
+                 composition within that limit gets is {:.1}%",
                 band.0 * 100.0,
                 band.1 * 100.0,
                 best * 100.0
@@ -309,10 +330,11 @@ pub struct Exploration {
     /// The whole-gene GC band that was asked for.
     pub band: (f64, f64),
     /// The deviation a composition, and any arrangement of it, must stay within.
+    /// This is `max_relax` whenever that is positive: a positive limit is a hard
+    /// bound, and a protein whose rounding floor sits above it is an error rather
+    /// than a quiet enlargement. For a frozen composition it is the rounding floor
+    /// itself, which is the deviation the frozen multiset already has.
     pub dev_limit: f64,
-    /// How far outside its band the whole-gene GC may sit. Zero unless the baseline
-    /// itself could not reach the band within the deviation limit.
-    pub gc_limit: f64,
 }
 
 /// How far a GC fraction sits outside its band; zero inside it.
@@ -337,9 +359,14 @@ pub const LIMIT_TOLERANCE: f64 = 1e-9;
 /// allocation and from a CAI-greedy allocation, keeping the compositions that stay
 /// inside the deviation limit and the GC band.
 ///
-/// The deviation limit is `max_relax`, except that the baseline allocation is always
-/// admitted: largest-remainder apportionment is L1-optimal, so no multiset deviates
-/// less, and rejecting it over integer rounding would leave nothing to build.
+/// Both limits are hard. A positive `max_relax` bounds every composition, including
+/// the apportioned baseline: largest-remainder apportionment is L1-optimal, so when
+/// even it deviates more, `DeviationFloor` says so rather than quietly raising the
+/// bound to fit. `--max-relax 0` keeps its own meaning, freezing the baseline and
+/// reporting the integer-rounding deviation it already has. The GC band is hard
+/// throughout: a composition outside it is not a composition, and a protein that
+/// cannot reach it within the deviation limit is `GcOutsideBudget`, never a widened
+/// band. Only the CAI expectation is ever relaxed.
 pub fn explore(
     protein: &[AaIdx],
     host: &HostTable,
@@ -348,20 +375,36 @@ pub fn explore(
     limits: &SearchLimits,
 ) -> Result<Exploration, CompositionError> {
     let baseline = build(protein, host, max_relax, gc_band)?;
-    let dev_limit = max_relax.max(baseline.deviation);
-    let gc_limit = gc_distance(baseline.gc, gc_band);
+    let frozen = max_relax <= 0.0;
+    // No multiset deviates less than the baseline, so a positive limit below its
+    // deviation is unsatisfiable, and saying so beats returning sequences that
+    // overrun the budget the caller set.
+    if !frozen && baseline.deviation > max_relax + LIMIT_TOLERANCE {
+        return Err(CompositionError::DeviationFloor {
+            best: baseline.deviation,
+            limit: max_relax,
+        });
+    }
+    let dev_limit = if frozen { baseline.deviation } else { max_relax };
     let max_compositions = limits.max_compositions.max(1);
+    let in_band = |gc: f64| gc_distance(gc, gc_band) <= LIMIT_TOLERANCE;
 
     // `--max-relax 0` freezes the multiset. Arrangement still explores, but there is
-    // exactly one composition to arrange.
-    if max_relax <= 0.0 {
+    // exactly one composition to arrange, and nothing can move its GC.
+    if frozen {
+        if !in_band(baseline.gc) {
+            return Err(CompositionError::GcOutsideBudget {
+                best: baseline.gc,
+                band: gc_band,
+                limit: max_relax,
+            });
+        }
         return Ok(Exploration {
             compositions: vec![baseline],
             expansions: 0,
             exhausted: false,
             band: gc_band,
             dev_limit,
-            gc_limit,
         });
     }
 
@@ -371,10 +414,7 @@ pub fn explore(
         if !dev.is_finite() || !gc.is_finite() {
             return None;
         }
-        if dev > dev_limit + LIMIT_TOLERANCE {
-            return None;
-        }
-        if gc_distance(gc, gc_band) > gc_limit + LIMIT_TOLERANCE {
+        if dev > dev_limit + LIMIT_TOLERANCE || !in_band(gc) {
             return None;
         }
         Some(Composition {
@@ -394,8 +434,7 @@ pub fn explore(
     let score = |counts: &[u32; N_CODONS]| -> (f64, f64, f64) {
         let dev = deviation(counts, host);
         let gc = gc_fraction(counts);
-        let slack = (dev - dev_limit).max(0.0)
-            + (gc_distance(gc, gc_band) - gc_limit).max(0.0);
+        let slack = (dev - dev_limit).max(0.0) + gc_distance(gc, gc_band);
         (slack, -crate::metrics::cai_of_counts(counts, host), dev)
     };
     let better = |a: &(f64, f64, f64, [u32; N_CODONS]), b: &(f64, f64, f64, [u32; N_CODONS])| {
@@ -408,7 +447,24 @@ pub fn explore(
 
     let mut seen: HashSet<[u32; N_CODONS]> = HashSet::new();
     let mut found: Vec<Composition> = Vec::new();
-    let record = |counts: &[u32; N_CODONS], found: &mut Vec<Composition>| {
+    // The GC closest to the band among multisets inside the deviation limit. It is
+    // what the error reports when nothing reaches the band, so the caller learns how
+    // far off the request was rather than only that it failed.
+    let mut closest_gc: Option<f64> = None;
+    let consider = |counts: &[u32; N_CODONS],
+                    found: &mut Vec<Composition>,
+                    closest: &mut Option<f64>| {
+        if deviation(counts, host) > dev_limit + LIMIT_TOLERANCE {
+            return;
+        }
+        let gc = gc_fraction(counts);
+        let nearer = match *closest {
+            Some(best) => gc_distance(gc, gc_band) < gc_distance(best, gc_band),
+            None => true,
+        };
+        if nearer {
+            *closest = Some(gc);
+        }
         if let Some(composition) = valid(counts) {
             found.push(composition);
         }
@@ -417,7 +473,7 @@ pub fn explore(
     let mut frontier: Vec<[u32; N_CODONS]> = Vec::new();
     for start in [baseline.counts, cai_greedy(protein, host)] {
         if seen.insert(start) {
-            record(&start, &mut found);
+            consider(&start, &mut found, &mut closest_gc);
             frontier.push(start);
         }
     }
@@ -436,20 +492,20 @@ pub fn explore(
                 if !seen.insert(child) {
                     continue;
                 }
-                record(&child, &mut found);
+                consider(&child, &mut found, &mut closest_gc);
                 let s = score(&child);
                 next.push((s.0, s.1, s.2, child));
                 // A transfer that buys CAI often pushes GC out of band. Offer the
                 // paired state that pays the cheapest synonymous move back, so the
                 // beam is not stopped by a barrier one transfer wide.
-                if gc_distance(gc_fraction(&child), gc_band) > gc_limit + LIMIT_TOLERANCE {
+                if !in_band(gc_fraction(&child)) {
                     let want_more_gc = gc_fraction(&child) < gc_band.0;
                     if let Some(mv) = best_gc_move(&child, host, want_more_gc) {
                         let mut paired = child;
                         paired[mv.from as usize] -= 1;
                         paired[mv.to as usize] += 1;
                         if seen.insert(paired) {
-                            record(&paired, &mut found);
+                            consider(&paired, &mut found, &mut closest_gc);
                             let s = score(&paired);
                             next.push((s.0, s.1, s.2, paired));
                         }
@@ -475,19 +531,28 @@ pub fn explore(
     }
 
     prune(&mut found, max_compositions);
-    if !found.iter().any(|c| c.counts == baseline.counts) {
+    // The baseline is kept when it is valid, since arrangement can fail for the
+    // high-CAI multiset and succeed for it. It is not forced in when it is not:
+    // an invalid composition is not a fallback, it is a limit violation.
+    let baseline_gc = baseline.gc;
+    if in_band(baseline.gc)
+        && baseline.deviation <= dev_limit + LIMIT_TOLERANCE
+        && !found.iter().any(|c| c.counts == baseline.counts)
+    {
         found.truncate(max_compositions.saturating_sub(1));
         found.push(baseline);
     }
+    if found.is_empty() {
+        // Deviation alone is satisfiable, since the baseline cleared it above, so
+        // the band is what nothing inside the limit could reach.
+        return Err(CompositionError::GcOutsideBudget {
+            best: closest_gc.unwrap_or(baseline_gc),
+            band: gc_band,
+            limit: max_relax,
+        });
+    }
 
-    Ok(Exploration {
-        compositions: found,
-        expansions,
-        exhausted,
-        band: gc_band,
-        dev_limit,
-        gc_limit,
-    })
+    Ok(Exploration { compositions: found, expansions, exhausted, band: gc_band, dev_limit })
 }
 
 /// Rank by descending CAI, then ascending deviation, then the count vector, drop
@@ -881,7 +946,11 @@ mod tests {
                 "a transfer may only move a count within its synonymous group"
             );
             assert!(composition.deviation <= found.dev_limit + LIMIT_TOLERANCE);
-            assert!(gc_distance(composition.gc, found.band) <= found.gc_limit + LIMIT_TOLERANCE);
+            assert_eq!(
+                gc_distance(composition.gc, found.band),
+                0.0,
+                "the requested band is hard"
+            );
             for codon in 0..N_CODONS as CodonIdx {
                 if composition.counts[codon as usize] > 0 {
                     assert!(host.freq(codon) > 0.0, "only codons the host uses");
@@ -958,5 +1027,58 @@ mod tests {
         let twice = explore(&seq, &host, 0.1, (0.30, 0.65), &SearchLimits::default()).unwrap();
         let counts = |e: &Exploration| e.compositions.iter().map(|c| c.counts).collect::<Vec<_>>();
         assert_eq!(counts(&once), counts(&twice));
+    }
+
+    #[test]
+    fn a_positive_limit_below_the_rounding_floor_is_refused() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let floor = build(&seq, &host, 0.1, (0.30, 0.65)).unwrap().deviation;
+        assert!(floor > 0.0, "integer rounding costs something");
+        let err = explore(&seq, &host, floor / 2.0, (0.30, 0.65), &SearchLimits::default())
+            .unwrap_err();
+        match err {
+            CompositionError::DeviationFloor { best, limit } => {
+                assert!((best - floor).abs() < 1e-12);
+                assert!((limit - floor / 2.0).abs() < 1e-12);
+            }
+            other => panic!("expected the floor to be reported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_band_out_of_reach_within_the_limit_is_refused() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let err = explore(&seq, &host, 0.01, (0.30, 0.40), &SearchLimits::default())
+            .unwrap_err();
+        match err {
+            CompositionError::GcOutsideBudget { best, band, limit } => {
+                assert_eq!(band, (0.30, 0.40));
+                assert!((limit - 0.01).abs() < 1e-12);
+                assert!(best > 0.40, "it should say how close it got: {best}");
+            }
+            other => panic!("expected the band to be reported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frozen_composition_outside_the_band_is_refused_too() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        // nothing can move a frozen multiset into a band it does not already meet
+        let err =
+            explore(&seq, &host, 0.0, (0.30, 0.40), &SearchLimits::default()).unwrap_err();
+        assert!(matches!(err, CompositionError::GcOutsideBudget { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_frozen_composition_reports_its_rounding_deviation_as_the_bound() {
+        let host = ecoli();
+        let seq = protein(GFP);
+        let found = explore(&seq, &host, 0.0, (0.30, 0.65), &SearchLimits::default()).unwrap();
+        assert_eq!(found.compositions.len(), 1);
+        assert_eq!(found.dev_limit, found.compositions[0].deviation);
+        assert!(found.dev_limit > 0.0, "the rounding cost is reported, not hidden");
     }
 }

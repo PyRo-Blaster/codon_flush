@@ -255,3 +255,149 @@ fn impossible_settings_are_refused_before_anything_is_optimised() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("must be different files"));
     assert!(std::fs::read_to_string(&input).unwrap().starts_with('>'), "input untouched");
 }
+
+// --- regressions for the review on 29bfb4d -------------------------------------
+
+#[test]
+fn a_positive_deviation_limit_below_the_rounding_floor_is_refused() {
+    // Was: five candidates at deviation 0.0083 under --max-relax 0.001, exit 0. The
+    // limit the caller set is a bound, not a suggestion; the rounding floor cannot
+    // quietly replace it.
+    let dir = workspace("floor");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    write(&input, &format!(">gfp\n{GFP}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--max-relax", "0.001",
+        "--retry-max-relax", "0.001",
+        "--quiet",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("smallest deviation"), "{stderr}");
+    assert!(stderr.contains("0.008333"), "it should say what the floor is: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        "",
+        "nothing may be written for a protein that cannot meet the request"
+    );
+}
+
+#[test]
+fn every_candidate_stays_inside_the_requested_gc_band() {
+    // Was: five candidates at GC 0.458 under --gc-high 0.40, status low_cai, exit 0.
+    // The fallback relaxes the CAI expectation and nothing else.
+    let dir = workspace("band");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    write(&input, &format!(">gfp\n{GFP}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--max-relax", "0.01",
+        "--retry-max-relax", "0.01",
+        "--gc-high", "0.40",
+        "--quiet",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "an unreachable band is a failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("GC cannot reach"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "");
+
+    // and with a band it can reach, every sequence written is actually inside it
+    let output = dir.join("ok.fasta");
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--gc-low", "0.40",
+        "--gc-high", "0.50",
+        "--quiet",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for (header, dna) in records(&std::fs::read_to_string(&output).unwrap()) {
+        let gc = dna.bytes().filter(|b| *b == b'G' || *b == b'C').count() as f64
+            / dna.len() as f64;
+        assert!((0.40..=0.50).contains(&gc), "{header} has GC {gc}");
+    }
+}
+
+#[test]
+fn a_frozen_composition_still_fills_the_candidate_set() {
+    // Was: three candidates from four arrangements and exit 1, because one frozen
+    // multiset with four restarts cannot produce five distinct sequences.
+    let dir = workspace("frozen");
+    let input = dir.join("p.fasta");
+    let output = dir.join("g.fasta");
+    let report_path = dir.join("r.json");
+    write(&input, &format!(">gfp\n{GFP}\n"));
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", output.to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", report_path.to_str().unwrap(),
+        "--max-relax", "0",
+        "--cai-threshold", "0.7",
+        "--quiet",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let written = records(&std::fs::read_to_string(&output).unwrap());
+    assert_eq!(written.len(), 5, "five were asked for and five are obtainable");
+    let unique: std::collections::HashSet<&String> = written.iter().map(|(_, d)| d).collect();
+    assert_eq!(unique.len(), 5, "and they are distinct, not padded");
+
+    let report = report_of(&report_path);
+    let attempt = &report["records"][0]["attempts"][0];
+    assert_eq!(report["records"][0]["status"], "ok");
+    assert_eq!(attempt["compositions"], 1, "the multiset stayed frozen");
+    assert!(
+        attempt["rounds"].as_u64().unwrap() > 1,
+        "restarts alone could not fill the set, so more rounds were needed"
+    );
+    assert_eq!(report["records"][0]["attempts"].as_array().unwrap().len(), 1,
+               "filling the set is not a retry");
+    // frozen means frozen: one deviation across the whole set
+    let deviations: std::collections::HashSet<String> = report["records"][0]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| format!("{:.12}", c["deviation"].as_f64().unwrap()))
+        .collect();
+    assert_eq!(deviations.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn two_spellings_of_one_output_path_are_refused_before_anything_is_written() {
+    // Was: a symlinked parent made two names for the same not-yet-existing file look
+    // different, and the report overwrote the FASTA.
+    let dir = workspace("alias");
+    let real = dir.join("out");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let input = dir.join("p.fasta");
+    write(&input, &format!(">gfp\n{}\n", &GFP[..30]));
+
+    let out = run(&[
+        "--input", input.to_str().unwrap(),
+        "--output", real.join("genes.fasta").to_str().unwrap(),
+        "--host-table", ECOLI_TABLE,
+        "--report-json", link.join("genes.fasta").to_str().unwrap(),
+        "--quiet",
+    ]);
+    assert!(!out.status.success(), "the collision must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("must be different files"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !real.join("genes.fasta").exists(),
+        "nothing may be created once the destinations collide"
+    );
+}
