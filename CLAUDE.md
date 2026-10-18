@@ -37,6 +37,11 @@ the two runs, `--report-json` writes the machine-readable report,
 `--inner-cycles` are accepted and ignored, with a warning: they described the old
 sampling loop.
 
+`.github/workflows/ci.yml` runs exactly these three on every push to `main` and every
+pull request, on 1.73 with `--locked` and `-D warnings`. Clippy is clean on 1.73; a
+newer clippy warns about `map_or` calls it would write as `is_none_or`, which is why
+the toolchain is pinned rather than floating.
+
 Host tables are JSON, either nested `{"A": {"GCA": 0.21, ...}}` as produced by
 `python_codon_tables`, or a flat codon map. Frequencies are renormalised per amino acid,
 so a table whose single-codon amino acids do not sum to 1 is repaired rather than
