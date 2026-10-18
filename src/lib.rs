@@ -9,6 +9,7 @@
 pub mod arrange;
 pub mod code;
 pub mod composition;
+pub mod batch;
 pub mod fasta;
 pub mod host;
 pub mod metrics;

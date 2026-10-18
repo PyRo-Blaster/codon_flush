@@ -1,0 +1,49 @@
+# The Rust engine's checks. Pinned to 1.73, which is what the project targets: the
+# dependency versions in Cargo.toml are held back for it, and clippy's newer lints
+# suggest std methods (Option::is_none_or among them) that 1.73 does not have, so a
+# floating toolchain would fail the build on advice the project cannot take.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: build, test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.73
+        run: |
+          rustup toolchain install 1.73.0 --profile minimal --component clippy
+          rustup default 1.73.0
+          rustc --version
+
+      - name: Cache cargo registry and target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-1.73.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-1.73.0-
+
+      # --locked, because the pins are the point: a resolver that quietly upgrades
+      # rayon or half breaks the build on this toolchain.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Release, because the search is the slow part and a debug suite takes minutes.
+      - name: Test
+        run: cargo test --locked --release
