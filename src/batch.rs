@@ -8,6 +8,7 @@
 //! The threshold is a retry trigger and a quality warning, never a filter: a complete
 //! set whose best CAI is low is still returned, with the shortfall reported.
 
+use crate::arrange::constraints::splice::Site;
 use crate::arrange::search::{optimise_all, Options, Outcome};
 use crate::code::AaIdx;
 use crate::composition::{self, gc_distance, Exploration, SearchLimits, LIMIT_TOLERANCE};
@@ -51,7 +52,8 @@ pub struct BatchOptions {
     pub limits: SearchLimits,
     pub retry: RetryPolicy,
     /// Arrangement settings. `seed` is the base of every derived stream; `restarts`
-    /// is the first run's count.
+    /// is the first run's count, and `splice_rule` decides whether a lone half site
+    /// is allowed.
     pub arrange: Options,
 }
 
@@ -93,6 +95,10 @@ pub struct Candidate {
     pub dev_limit: f64,
     pub moves: usize,
     pub substitutions: usize,
+    /// Splice motifs this gene still contains. Empty unless the splice rule permits
+    /// a lone half site, in which case every retained site is named here with its
+    /// position so it can be checked against the vector the gene will go into.
+    pub retained_splice_sites: Vec<Site>,
 }
 
 /// What one run cost and found.
@@ -450,18 +456,27 @@ fn accept(
         dev_limit: exploration.dev_limit,
         moves: outcome.moves,
         substitutions: outcome.substitutions,
+        retained_splice_sites: outcome.retained_splice_sites.clone(),
     })
 }
 
-/// Sort by descending CAI, then ascending deviation, then the sequence itself, and
-/// drop repeats of the same gene. Every key is a number or the DNA, so the order is
-/// the same whatever order the arrangements finished in.
+/// Sort by descending CAI, then ascending deviation, then fewest retained splice
+/// sites, then the sequence itself, and drop repeats of the same gene. Every key is
+/// a number or the DNA, so the order is the same whatever order the arrangements
+/// finished in.
+///
+/// The retained-sites key only ever breaks a tie, so the CAI-first contract is
+/// untouched. It matters under the pair rule: once a gene has no acceptors the
+/// search has no reason to remove avoidable donors, so equally good genes can carry
+/// very different numbers of lone half sites, and fewer is better for anything that
+/// will be dropped into a vector.
 fn rank(pool: &mut Vec<Candidate>) {
     pool.sort_by(|a, b| {
         b.cai
             .partial_cmp(&a.cai)
             .unwrap()
             .then(a.deviation.partial_cmp(&b.deviation).unwrap())
+            .then(a.retained_splice_sites.len().cmp(&b.retained_splice_sites.len()))
             .then(a.dna.cmp(&b.dna))
             .then(a.run.cmp(&b.run))
             .then(a.composition.cmp(&b.composition))
@@ -509,6 +524,7 @@ mod tests {
             dev_limit: 0.1,
             moves: 0,
             substitutions: 0,
+            retained_splice_sites: Vec::new(),
         }
     }
 

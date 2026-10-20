@@ -19,7 +19,7 @@ original Codon Harmony.
 
 ```bash
 cargo build --release
-cargo test                        # 126 tests, about 5 min in debug
+cargo test                        # 138 tests, about 5 min in debug
 cargo clippy --all-targets        # expected to be clean
 ./target/release/codon_harmony \
     --input proteins.fasta \
@@ -32,6 +32,7 @@ Useful flags: `--candidates` and `--cai-threshold` size the candidate set and se
 retry trigger, `--retry-max-relax` / `--retry-restarts` / `--composition-budget` tune
 the two runs, `--report-json` writes the machine-readable report,
 `--max-relax 0` freezes the codon profile (no substitutions at all),
+`--splice-rule no-pair` allows a lone splice donor (see *Splice sites*),
 `--start-site-rule purine-run` restores the original start-site definition, and
 `--seed` / `--restarts` / `--threads` control the search. `--cycles` and
 `--inner-cycles` are accepted and ignored, with a warning: they described the old
@@ -170,6 +171,35 @@ A run that is short of candidates keeps arranging on fresh streams up to
 `ARRANGEMENT_SURPLUS * wanted` attempts, because one frozen multiset with four restarts
 cannot give five distinct genes. That is not a retry; the one-retry CAI rule is
 separate.
+
+## Splice sites
+
+Thirty tripeptides, `{M,W} x {C,W,Y} x {A,D,E,G,V}`, force a donor in every synonymous
+encoding: the GT that defines one straddles a codon boundary where no substitution
+reaches. It is a property of the genetic code, not the host table — the same 30 come
+out with every codon available — and no 4-residue peptide forces an *acceptor*, across
+all 160,000 of them. Antibody constant regions contain these tripeptides, which is why
+the default rule cannot build them.
+
+`splice::Rule` therefore has two settings. `NoMotif` is the default and the original
+meaning: no donor, no acceptor. `NoPair` forbids only a donor and an acceptor together,
+since splicing needs both. Under `NoPair` the objective is `min(donors, acceptors)`,
+which is **global**: `delta` reads the running counts in `self.found` and adds the
+window deltas, which is sound because both views are taken against the pre-move state.
+Both rules have their own oracle and their own incremental test; `NoPair`'s is the one
+that proves a window delta can reconstruct a whole-gene objective.
+
+Sites are counted **once per position per kind**, however many of the 20 donor or 10
+acceptor patterns match. Counting pattern hits made one site read as three, which sent
+a review hunting for three problems; do not reintroduce it.
+
+A gene valid under `NoPair` can still carry half sites, so `Outcome` and `Candidate`
+carry `retained_splice_sites` and the CLI discloses every one with its position, in the
+FASTA description and the JSON. That disclosure is load-bearing: a lone donor is inert
+only relative to the CDS, and can still pair with an acceptor in the vector's
+expression cassette. `NoPair` also does not minimise half sites — once acceptors reach
+zero the objective is flat — so ranking breaks exact CAI/deviation ties by preferring
+fewer.
 
 ## Constraint definitions
 

@@ -17,6 +17,21 @@ use codon_harmony_core::host::HostTable;
 use codon_harmony_core::code;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SpliceRule {
+    NoMotif,
+    NoPair,
+}
+
+impl From<SpliceRule> for codon_harmony_core::arrange::constraints::splice::Rule {
+    fn from(value: SpliceRule) -> Self {
+        match value {
+            SpliceRule::NoMotif => Self::NoMotif,
+            SpliceRule::NoPair => Self::NoPair,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum StartSiteRule {
     ShineDalgarno,
     PurineRun,
@@ -107,6 +122,20 @@ struct Cli {
     /// Remove RNA splice sites. Use for mammalian hosts.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     remove_splice_sites: bool,
+
+    /// What counts as a splice problem. "no-motif", the default, rejects every
+    /// donor and every acceptor. "no-pair" rejects only a donor and an acceptor
+    /// together, on the grounds that splicing needs both: a lone half site cannot
+    /// define an intron within the coding sequence. Some proteins leave no choice —
+    /// 30 tripeptides, all of the form [MW][CWY][ADEGV], force a donor in every
+    /// synonymous encoding — and "no-pair" is what lets those be built at all.
+    /// CAVEAT: a lone donor is inert only relative to the coding sequence. A
+    /// transgene is expressed from a vector, and a donor inside the insert can still
+    /// pair with an acceptor downstream in the vector's expression cassette, which
+    /// is the usual mammalian arrangement. Every retained site is reported with its
+    /// position so the gene can be checked against that vector.
+    #[arg(long, value_enum, default_value_t = SpliceRule::NoMotif)]
+    splice_rule: SpliceRule,
 
     /// Remove alternate start sites. Use for bacterial hosts.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -330,6 +359,7 @@ fn check(cli: &Cli) -> Result<BatchOptions> {
             remove_start_sites: cli.remove_start_sites,
             start_site_rule: cli.start_site_rule.into(),
             remove_splice_sites: cli.remove_splice_sites,
+            splice_rule: cli.splice_rule.into(),
             ..Default::default()
         },
     })
@@ -441,6 +471,14 @@ fn header_for(
     if report.low_cai {
         header.push_str(" low_cai=true");
     }
+    // A gene the pair rule let through keeps its half sites, and the header is
+    // where someone pasting this into a vector will see them.
+    if !candidate.retained_splice_sites.is_empty() {
+        header.push_str(&format!(
+            " retained_splice_sites={}",
+            describe_sites(&candidate.retained_splice_sites)
+        ));
+    }
     header.push_str(&format!(" source={}", record.id));
     if !record.description.is_empty() {
         header.push(' ');
@@ -548,7 +586,23 @@ fn tell(record: &Record, report: &RecordReport, cli: &Cli) {
             candidate.composition,
             candidate.restart
         );
+        if !candidate.retained_splice_sites.is_empty() {
+            println!(
+                "      keeps {} splice site(s) no encoding can avoid: {}",
+                candidate.retained_splice_sites.len(),
+                describe_sites(&candidate.retained_splice_sites)
+            );
+        }
     }
+}
+
+/// Retained splice sites as `donor@124,acceptor@871`, in position order.
+fn describe_sites(sites: &[codon_harmony_core::arrange::constraints::splice::Site]) -> String {
+    sites
+        .iter()
+        .map(|site| format!("{}@{}", site.kind(), site.at + 1))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The shortest honest account of why a protein produced nothing, from the run that
@@ -641,6 +695,11 @@ fn report_json(
                     "dev_limit": c.dev_limit,
                     "moves": c.moves,
                     "substitutions": c.substitutions,
+                    "retained_splice_sites": c.retained_splice_sites.iter().map(|site| json!({
+                        "at": site.at + 1,
+                        "kind": site.kind(),
+                        "sequence": site.text,
+                    })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -653,6 +712,10 @@ fn report_json(
         "host_table": cli.host_table.display().to_string(),
         "host_threshold": cli.host_threshold,
         "gc_band": [cli.gc_low, cli.gc_high],
+        "splice_rule": match cli.splice_rule {
+            SpliceRule::NoMotif => "no-motif",
+            SpliceRule::NoPair => "no-pair",
+        },
         "candidates_requested": options.wanted,
         "cai_threshold": options.cai_threshold,
         "policy": {

@@ -42,6 +42,8 @@ pub struct Options {
     pub remove_start_sites: bool,
     pub start_site_rule: start_site::Rule,
     pub remove_splice_sites: bool,
+    /// What counts as a splice problem: no motif at all, or no donor-acceptor pair.
+    pub splice_rule: splice::Rule,
     /// Whole-gene GC bounds. Swaps cannot move whole-gene GC, but substitutions
     /// change the multiset and so can walk it out of the band; this keeps them
     /// inside it rather than leaving acceptance to throw the arrangement away.
@@ -67,6 +69,7 @@ impl Default for Options {
             remove_start_sites: true,
             start_site_rule: start_site::Rule::ShineDalgarno,
             remove_splice_sites: true,
+            splice_rule: splice::Rule::NoMotif,
             gc_band: (0.30, 0.65),
         }
     }
@@ -84,6 +87,10 @@ pub struct Outcome {
     pub moves: usize,
     pub substitutions: usize,
     pub restart: usize,
+    /// Splice motifs the finished gene still contains, whether or not the rule
+    /// objects to them. Under the pair rule a gene can be valid and still carry a
+    /// lone donor, and the caller has to be able to say where it is.
+    pub retained_splice_sites: Vec<splice::Site>,
 }
 
 fn build_constraints(options: &Options) -> ConstraintSet {
@@ -100,7 +107,7 @@ fn build_constraints(options: &Options) -> ConstraintSet {
         constraints.push(Box::new(start_site::StartSites::with_rule(options.start_site_rule)));
     }
     if options.remove_splice_sites {
-        constraints.push(Box::new(splice::SpliceSites::new()));
+        constraints.push(Box::new(splice::SpliceSites::with_rule(options.splice_rule)));
     }
     ConstraintSet::new(constraints)
 }
@@ -375,10 +382,19 @@ fn run_once(
     }
 
     let remaining = constraints.report(&state);
+    // Listed from a fresh detector rather than the set, which hands out only the
+    // violations the rule objects to. A retained lone site is not a violation and
+    // still has to be disclosed.
+    let retained_splice_sites = if options.remove_splice_sites {
+        splice::SpliceSites::with_rule(options.splice_rule).sites(&state)
+    } else {
+        Vec::new()
+    };
     Outcome {
         violations: constraints.total(),
         by_kind: constraints.totals_by_kind(),
         remaining,
+        retained_splice_sites,
         deviation: metrics::deviation_of(&state, host),
         cai: metrics::cai(&state, host),
         gc: metrics::gc_of(&state),
