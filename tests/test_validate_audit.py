@@ -4,8 +4,8 @@
 found it passing output whose every reported metric had been replaced with a flattering
 number, so these tests feed it deliberately wrong claims and require each to be caught.
 
-Only the metric and audit helpers are exercised, which import nothing from Biopython,
-so this runs wherever pytest does.
+Only the metric and audit helpers are exercised. The auditor is pure standard library,
+so this runs wherever pytest does, and CI runs it.
 """
 import copy
 import importlib.util

@@ -4,8 +4,9 @@ Reverse-translates a protein and optimises the gene for a host's codon usage, re
 the sequence features that make genes hard to synthesise or express.
 
 This repository holds a Rust engine (`src/`) that replaces the original Python
-implementation's optimisation algorithm. The Python package (`codon_harmony/`) is kept
-as the reference implementation and as an independent auditor of the Rust output.
+implementation. That implementation has now been removed; what survives of it is
+`scripts/validate.py`, a standalone auditor that re-derives the engine's numbers from
+its output and checks its claims against them.
 
 ## Why it was rewritten
 
@@ -215,30 +216,32 @@ eight-base window can match several; it is one site, and is counted and reported
 
 ## Verifying the output
 
-`scripts/validate.py` reads a protein FASTA and the genes the Rust tool produced, maps
-each candidate back to its source protein through the `source=` field rather than
-trusting the tool's grouping, and independently re-checks translation, deviation, GC
-and CAI using Biopython and the original Python package, so nothing is self-certified.
-Every number it prints is re-derived from the sequence: translation and the legacy
-Biopython CAI need Biopython < 1.78, while GC and the engine-convention CAI are
-recomputed here from the host table. The claims in the FASTA descriptions and in the
-report are then checked *against* those, so a wrong CAI, a wrong ranking or an
-out-of-band sequence fails the audit instead of passing it. Given the report it also
-checks set size, distinctness, ranking by the recomputed CAI, the requested GC band,
-the deviation bound that applied, and whether the retry fired exactly when the declared
-policy says it should.
+`scripts/validate.py` reads a protein FASTA and the genes the Rust tool produced, and
+maps each candidate back to its source protein through the `source=` field rather than
+trusting the tool's grouping, so nothing is self-certified. Every number it prints is
+re-derived from the sequence — translation, GC, CAI and
+deviation — and the claims in the FASTA descriptions and in the report are then checked
+*against* those, so a wrong CAI, a wrong ranking or an out-of-band sequence fails the
+audit instead of passing it. Given the report it also checks set size, distinctness,
+ranking by the recomputed CAI, the requested GC band, the deviation bound that applied,
+and whether the retry fired exactly when the declared policy says it should.
+
+It needs **only the Python standard library**, so it runs anywhere and CI runs it. Each
+metric is a second implementation written from its definition rather than shared with
+the engine, which is what makes the check worth running; on real output the two agree
+to the last bit. Deviation follows the original tool's `compare_profiles` at
+`relax=1.0`.
 
 `tests/test_validate_audit.py` feeds the auditor deliberately falsified reports and
-requires each to be caught; it needs pytest but not Biopython.
+requires each to be caught.
 
 ```
 python scripts/validate.py proteins.fasta genes.fasta tests/data/e_coli_316407.json
 python scripts/validate.py proteins.fasta genes.fasta table.json report.json
 ```
 
-The CAI it prints is Biopython's, which divides the log sum by `len - 1` where the Rust
-engine uses `len`. The two are labelled separately and are expected to differ in the
-last digits rather than to match.
+A protein the report accounts for with `no_valid_candidates` or `error` is reported as
+such rather than as missing output; any other absence is a failure.
 
 ## Tests
 

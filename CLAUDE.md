@@ -8,10 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 usage, removing features that make genes hard to synthesise or express. The CLI returns
 several ranked candidates per protein, not one gene; see *Candidates and the retry*.
 
-The optimiser is the **Rust engine in `src/`**. The Python package in `codon_harmony/`
-is the original implementation, kept as the reference and as an independent auditor of
-the Rust output; it is no longer the engine. Both are MIT licensed, derived from the
-original Codon Harmony.
+The optimiser is the **Rust engine in `src/`**, and it is the whole of the tool. The
+original Python implementation has been removed; what remains of it is
+`scripts/validate.py`, a standalone auditor that re-derives the engine's numbers
+independently. MIT licensed, derived from the original Codon Harmony — see
+`AUTHORS.rst`, `LICENSE` and `README.rst`, the upstream project's own README, kept for
+provenance.
 
 ## Commands
 
@@ -38,8 +40,8 @@ the two runs, `--report-json` writes the machine-readable report,
 `--inner-cycles` are accepted and ignored, with a warning: they described the old
 sampling loop.
 
-`.github/workflows/ci.yml` runs exactly these three on every push to `main` and every
-pull request, on 1.73 with `--locked` and `-D warnings`. Clippy is clean on 1.73; a
+`.github/workflows/ci.yml` runs exactly these three, plus the auditor's tests, on
+every push to `main` and every pull request, on 1.73 with `--locked` and `-D warnings`. Clippy is clean on 1.73; a
 newer clippy warns about `map_or` calls it would write as `is_none_or`, which is why
 the toolchain is pinned rather than floating.
 
@@ -59,22 +61,19 @@ Re-derives every number from the sequences and checks the engine's claims *again
 them, rather than printing both and trusting the claim: a falsified CAI, a wrong
 ranking or an out-of-band sequence must fail the audit. Candidates map back to their
 source protein through the `source=` field, not through the Rust tool's grouping.
-Biopython's CAI divides by `len - 1` where the engine uses `len`, so it is a separate
-column and never what a claim is checked against; the engine-convention CAI is
-recomputed in plain Python from the host table and agrees with the Rust value to the
-last bit. The metric and audit helpers import nothing from Biopython, so
-`pytest tests/test_validate_audit.py` can exercise them on falsified input anywhere.
 
-### Python package
+It is **pure standard library** — no Biopython, no `codon_harmony` — so it runs
+anywhere, and CI runs it. Translation, GC, CAI and deviation are each a second
+implementation written from the definition rather than shared with the engine, which
+is what makes the check worth running; the two agree to the last bit on real output.
+Deviation follows the original `seq_opt.compare_profiles` at `relax=1.0`: the ideal
+count per codon is its host frequency times the synonymous group's size, rounded half
+to even, and the deviation is half the total absolute difference over the total ideal.
+A protein the report accounts for with `no_valid_candidates` or `error` is not counted
+as missing output; any other absence is.
 
-```bash
-pytest tests/        # 37 pass, 3 fail
-flake8
-```
-
-The three failures are pre-existing and unrelated to this work: two need `misc/`
-fixtures that are not in this copy of the repository, and one expects a network 404 for
-a bogus taxonomy ID.
+`pytest tests/test_validate_audit.py` feeds the auditor deliberately falsified reports
+and requires each to be caught.
 
 ## Environment constraints
 
@@ -82,7 +81,8 @@ a bogus taxonomy ID.
   `rayon` is pinned to `=1.8.1` with `rayon-core` at 1.12.1, `half` to 2.2.1 and
   `criterion` to `=0.5.1`. Bumping them breaks the build. `Option::is_none_or` and other
   recent std additions are unavailable.
-- The Python side needs **Biopython < 1.78**, because it uses `Bio.Alphabet`.
+- The auditor needs **only the Python standard library**. It used to need
+  Biopython < 1.78, which is why it could not run in CI; keep it dependency-free.
 
 ## Architecture
 

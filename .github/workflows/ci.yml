@@ -26,6 +26,12 @@ jobs:
           rustup default 1.73.0
           rustc --version
 
+      # The auditor is standard library only, but pytest is not, and a system
+      # Python on a runner may refuse to install into itself.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Cache cargo registry and target directory
         uses: actions/cache@v4
         with:
@@ -47,3 +53,24 @@ jobs:
       # Release, because the search is the slow part and a debug suite takes minutes.
       - name: Test
         run: cargo test --locked --release
+
+      # The auditor exists to stop the engine certifying its own output, so its
+      # negative tests belong here. It is pure standard library on purpose: it used
+      # to need Biopython < 1.78, which is why it could not run in CI at all.
+      - name: Audit tests
+        run: |
+          pip install --quiet pytest
+          pytest tests/test_validate_audit.py -q
+
+      # And the auditor itself, against real output, so a release that passes the
+      # Rust suite but writes a gene that fails an independent check still fails.
+      - name: Audit real output
+        run: |
+          cargo build --locked --release --bin codon_harmony
+          printf '>gfp\n%s\n' "$(sed -n 's/^pub const GFP: &str = "\(.*\)";$/\1/p' src/testdata.rs)" > /tmp/proteins.fasta
+          ./target/release/codon_harmony \
+            --input /tmp/proteins.fasta --output /tmp/genes.fasta \
+            --host-table tests/data/e_coli_316407.json \
+            --report-json /tmp/report.json --quiet
+          python3 scripts/validate.py /tmp/proteins.fasta /tmp/genes.fasta \
+            tests/data/e_coli_316407.json /tmp/report.json
