@@ -232,9 +232,26 @@ def audit_report(report, genes_by_source, weights, deviations):
     def fault(name, message):
         problems.append("%s: %s" % (name, message))
 
+    # Every input protein needs a record. Without this, a report with its records
+    # array emptied or truncated passes everything below by having nothing to check:
+    # set size, ranking, low_cai and the retry policy would all go unexamined.
+    for name in genes_by_source:
+        if not any(record.get("id") == name for record in report["records"]):
+            fault(name, "the report has no record for this protein")
+
     for record in report["records"]:
         name, candidates = record["id"], record["candidates"]
         written = genes_by_source.get(name, [])
+
+        # A record the engine failed outright has no candidates and never ran a
+        # search, so the quality checks below have nothing to measure. What it must
+        # still be is empty: an error that reported candidates would be a real fault.
+        if record.get("status") == "error" or not record["attempts"]:
+            if candidates or record["candidate_count"] or written:
+                fault(name, "reports an error but still claims candidates")
+            if record.get("status") != "error":
+                fault(name, "ran no search but is not reported as an error")
+            continue
         if [c["dna"] for c in candidates] != written:
             fault(name, "report and FASTA disagree about its candidates")
         if len(candidates) > wanted:

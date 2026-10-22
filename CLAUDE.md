@@ -13,7 +13,7 @@ original Python implementation has been removed; what remains of it is
 `scripts/validate.py`, a standalone auditor that re-derives the engine's numbers
 independently. MIT licensed, derived from the original Codon Harmony — see
 `AUTHORS.rst`, `LICENSE` and `README.rst`, the upstream project's own README, kept for
-provenance.
+provenance and marked as such at the top.
 
 ## Commands
 
@@ -70,7 +70,10 @@ Deviation follows the original `seq_opt.compare_profiles` at `relax=1.0`: the id
 count per codon is its host frequency times the synonymous group's size, rounded half
 to even, and the deviation is half the total absolute difference over the total ideal.
 A protein the report accounts for with `no_valid_candidates` or `error` is not counted
-as missing output; any other absence is.
+as missing output; any other absence is. An `error` record never searched, so the
+audit requires only that it claims nothing, and skips the quality checks there is
+nothing to measure. Every input protein must have a record: without that, a report
+with its `records` emptied would pass by having nothing left to check.
 
 `pytest tests/test_validate_audit.py` feeds the auditor deliberately falsified reports
 and requires each to be caught.

@@ -176,3 +176,89 @@ def test_the_fasta_description_claim_is_checked_too():
     _, problems = validate.check_candidate(LESS_USED, description, WEIGHTS)
     assert any("CLAIMED CAI" in p for p in problems), problems
     assert any("CLAIMED GC" in p for p in problems), problems
+
+
+# --- absences: a protein the engine refused is not a missing output -------------
+
+def error_report(name="p1"):
+    """What the engine writes for a protein it refuses before searching."""
+    return {
+        "candidates_requested": 5,
+        "cai_threshold": 0.80,
+        "gc_band": [0.30, 0.65],
+        "policy": {
+            "first": {"max_relax": 0.10, "restarts": 4, "expansion_budget": 2000},
+            "retry": {"max_relax": 0.20, "restarts": 8, "expansion_budget": 4000},
+        },
+        "records": [{
+            "id": name,
+            "candidates": [],
+            "candidate_count": 0,
+            # the engine leaves this at its default when it never searched
+            "low_cai": False,
+            "status": "error",
+            "attempts": [],
+        }],
+    }
+
+
+def test_an_error_record_explains_its_own_absence():
+    assert validate.explains_absence(error_report(), "p1") == "error"
+
+
+def test_a_no_valid_candidates_record_explains_its_own_absence():
+    report = error_report()
+    report["records"][0]["status"] = "no_valid_candidates"
+    report["records"][0]["attempts"] = [{"run": 1, "best_cai": None}]
+    assert validate.explains_absence(report, "p1") == "no_valid_candidates"
+
+
+def test_an_absence_with_no_report_is_not_explained():
+    assert validate.explains_absence(None, "p1") is None
+
+
+def test_an_absence_a_successful_record_does_not_account_for_is_not_explained():
+    report = honest_report([PREFERRED])
+    report["records"][0]["status"] = "ok"
+    assert validate.explains_absence(report, "p1") is None
+
+
+def test_an_absence_of_any_record_is_not_explained():
+    assert validate.explains_absence(error_report(), "somebody_else") is None
+
+
+def test_an_error_record_passes_the_audit_instead_of_failing_it():
+    """The engine refused the protein and exited non-zero; the auditor must not
+    pile on with quality checks there is nothing to measure."""
+    report = error_report()
+    assert validate.audit_report(report, {"p1": []}, WEIGHTS, {}) == []
+
+
+def test_an_error_record_that_claims_candidates_is_still_caught():
+    report = error_report()
+    report["records"][0]["candidates"] = [honest_report([PREFERRED])["records"][0]["candidates"][0]]
+    problems = validate.audit_report(report, {"p1": [PREFERRED]}, WEIGHTS, {})
+    assert any("reports an error but still claims candidates" in p for p in problems), problems
+
+
+def test_a_record_that_ran_nothing_without_saying_error_is_caught():
+    report = error_report()
+    report["records"][0]["status"] = "ok"
+    problems = validate.audit_report(report, {"p1": []}, WEIGHTS, {})
+    assert any("ran no search but is not reported as an error" in p for p in problems), problems
+
+
+# --- a report cannot drop a protein to avoid being checked ----------------------
+
+def test_a_report_missing_a_record_for_an_input_protein_is_caught():
+    report = honest_report([PREFERRED, LESS_USED])
+    report["records"] = []
+    problems = validate.audit_report(report, {"p1": [PREFERRED, LESS_USED]}, WEIGHTS, {})
+    assert any("no record for this protein" in p for p in problems), problems
+
+
+def test_dropping_one_record_of_several_is_caught():
+    report = honest_report([PREFERRED, LESS_USED])
+    written = {"p1": [PREFERRED, LESS_USED], "p2": [PREFERRED]}
+    problems = validate.audit_report(report, written, WEIGHTS, {})
+    assert any("p2" in p and "no record" in p for p in problems), problems

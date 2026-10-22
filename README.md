@@ -241,11 +241,13 @@ python scripts/validate.py proteins.fasta genes.fasta table.json report.json
 ```
 
 A protein the report accounts for with `no_valid_candidates` or `error` is reported as
-such rather than as missing output; any other absence is a failure.
+such rather than as missing output; any other absence is a failure. An `error` record
+never searched, so it is required only to claim nothing. Every input protein must have
+a record, so a report cannot drop one to escape being checked.
 
 ## Tests
 
-`cargo test` runs 138 tests, and `pytest tests/test_validate_audit.py` runs 13 more
+`cargo test` runs 138 tests, and `pytest tests/test_validate_audit.py` runs 23 more
 against the auditor itself. The backbone is differential: every constraint detector is
 checked against a brute-force oracle on random sequences, and its incremental
 bookkeeping is checked against a full rebuild after every move across 20,000 random
