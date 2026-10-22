@@ -1,3 +1,9 @@
+..
+   PROVENANCE ONLY. This is the README of the original Python Codon Harmony, the
+   project this repository is derived from. That implementation has been removed and
+   replaced by the Rust engine; nothing described below ships here any more, and the
+   badges and links point at the upstream project. See README.md for this tool.
+
 =============
 Codon Harmony
 =============

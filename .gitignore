@@ -1,13 +1,9 @@
 # Rust build output
 /target/
 
-# Python build and cache
+# Python cache, from running the auditor and its tests
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
 
 # Local tool settings and OS cruft
 .claude/
@@ -16,7 +12,3 @@ dist/
 # Generated sequences
 out.fasta
 failed_seqs.fasta
-
-# Written by the Python test suite's codon table downloader
-human_codon_table
-human_codon_table.json
